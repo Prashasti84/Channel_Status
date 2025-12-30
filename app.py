@@ -31,7 +31,12 @@ GIPHY_API_BASE = 'https://api.giphy.com/v1'
 USE_API = os.environ.get('USE_GIPHY_API', 'true').lower() == 'true'
 
 # Database configuration
-DB_NAME = 'giphy_tracking.db'
+# On Vercel, use /tmp directory since filesystem is read-only except /tmp
+# Check if running on Vercel by checking for VERCEL environment variable
+if os.environ.get('VERCEL'):
+    DB_NAME = '/tmp/giphy_tracking.db'
+else:
+    DB_NAME = 'giphy_tracking.db'
 
 # Initialize database
 def init_database():
