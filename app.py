@@ -4959,7 +4959,45 @@ def get_realtime_views():
 @app.route('/static/<path:filename>')
 def static_files(filename):
     """Serve static files explicitly for Vercel compatibility"""
-    return app.send_static_file(filename)
+    try:
+        # Use Flask's built-in static file serving (most reliable)
+        return app.send_static_file(filename)
+    except Exception as e:
+        print(f"Error serving static file {filename}: {str(e)}")
+        # Try alternative path resolution for Vercel
+        try:
+            # Get the absolute path to static folder
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            static_dir = os.path.join(current_dir, 'static')
+            file_path = os.path.join(static_dir, filename)
+            
+            # Security check - ensure file is within static directory
+            if not os.path.abspath(file_path).startswith(os.path.abspath(static_dir)):
+                return "Forbidden", 403
+            
+            # Check if file exists
+            if not os.path.exists(file_path):
+                return f"File not found: {filename}", 404
+            
+            # Determine content type
+            if filename.endswith('.css'):
+                content_type = 'text/css'
+            elif filename.endswith('.js'):
+                content_type = 'application/javascript'
+            else:
+                content_type = 'application/octet-stream'
+            
+            # Read and return file
+            with open(file_path, 'rb') as f:
+                content = f.read()
+            
+            from flask import Response
+            response = Response(content, mimetype=content_type)
+            response.headers['Cache-Control'] = 'public, max-age=31536000'
+            return response
+        except Exception as e2:
+            print(f"Alternative static file serving also failed: {str(e2)}")
+            return f"Error loading {filename}: {str(e2)}", 404
 
 @app.route('/')
 def index():
