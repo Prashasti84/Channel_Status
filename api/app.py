@@ -1,5 +1,6 @@
 """
 Vercel serverless function entry point for Flask app
+This file imports the main app.py from the parent directory
 """
 import sys
 import os
@@ -8,8 +9,10 @@ import os
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, parent_dir)
 
+# Import the Flask app from the main app.py file
 from app import app
 
 # Vercel expects the app to be exported directly
 # The @vercel/python builder will handle WSGI conversion
 __all__ = ['app']
+
