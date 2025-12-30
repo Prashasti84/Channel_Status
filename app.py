@@ -20,7 +20,7 @@ try:
 except ImportError:
     pass
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static', static_url_path='/static')
 CORS(app)
 
 # Giphy API configuration
@@ -4955,6 +4955,11 @@ def get_realtime_views():
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/static/<path:filename>')
+def static_files(filename):
+    """Serve static files explicitly for Vercel compatibility"""
+    return app.send_static_file(filename)
 
 @app.route('/')
 def index():
