@@ -1474,7 +1474,11 @@ def fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=True, use_
     }
 
 # Lightweight cache file for real-time comparison (no database needed)
-CACHE_FILE = 'channel_views_cache.json'
+# Use /tmp on Vercel (serverless) for writable filesystem, otherwise use local file
+if os.path.exists('/tmp'):
+    CACHE_FILE = os.environ.get('CACHE_PATH', '/tmp/channel_views_cache.json')
+else:
+    CACHE_FILE = 'channel_views_cache.json'
 
 def get_cached_views(channel_id):
     """Get last cached views for a channel from lightweight JSON file"""
@@ -1490,26 +1494,31 @@ def get_cached_views(channel_id):
 
 def cache_views(channel_id, views_data):
     """Cache current views for a channel in lightweight JSON file"""
-    cache = {}
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, 'r') as f:
-                cache = json.load(f)
-        except:
-            cache = {}
-    
-    cache[channel_id] = {
-        'total_views': views_data['total_views'],
-        'gif_views': views_data.get('gif_views', {}),
-        'timestamp': views_data.get('timestamp', datetime.now().isoformat()),
-        'fetched_count': views_data.get('fetched_count', 0)
-    }
-    
     try:
-        with open(CACHE_FILE, 'w') as f:
-            json.dump(cache, f, indent=2)
+        cache = {}
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, 'r') as f:
+                    cache = json.load(f)
+            except:
+                cache = {}
+        
+        cache[channel_id] = {
+            'total_views': views_data['total_views'],
+            'gif_views': views_data.get('gif_views', {}),
+            'timestamp': views_data.get('timestamp', datetime.now().isoformat()),
+            'fetched_count': views_data.get('fetched_count', 0)
+        }
+        
+        try:
+            with open(CACHE_FILE, 'w') as f:
+                json.dump(cache, f, indent=2)
+        except Exception as e:
+            print(f"  Warning: Could not cache views: {e}")
+            # On Vercel, cache might not persist between invocations - this is expected
     except Exception as e:
-        print(f"  Warning: Could not cache views: {e}")
+        print(f"  Warning: Cache operation failed: {e}")
+        # Continue without caching - not critical for functionality
 
 def get_realtime_channel_views_comparison(channel_id, gif_ids):
     """
