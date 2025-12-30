@@ -20,7 +20,7 @@ try:
 except ImportError:
     pass
 
-app = Flask(__name__, static_folder='static', static_url_path='/static')
+app = Flask(__name__)
 CORS(app)
 
 # Giphy API configuration
@@ -31,76 +31,65 @@ GIPHY_API_BASE = 'https://api.giphy.com/v1'
 USE_API = os.environ.get('USE_GIPHY_API', 'true').lower() == 'true'
 
 # Database configuration
-# Use /tmp on Vercel (serverless) for writable filesystem, otherwise use local file
-if os.path.exists('/tmp'):
-    DB_NAME = os.environ.get('DB_PATH', '/tmp/giphy_tracking.db')
-else:
-    DB_NAME = 'giphy_tracking.db'
+DB_NAME = 'giphy_tracking.db'
 
 # Initialize database
 def init_database():
     """Initialize the SQLite database with required tables"""
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        
-        # Table for channels/users
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS channels (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id TEXT UNIQUE NOT NULL,
-                username TEXT,
-                user_id TEXT,
-                display_name TEXT,
-                profile_url TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Table for GIFs
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS gifs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                gif_id TEXT UNIQUE NOT NULL,
-                channel_id TEXT NOT NULL,
-                title TEXT,
-                url TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
-            )
-        ''')
-        
-        # Table for view history (daily tracking)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS view_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                gif_id TEXT NOT NULL,
-                view_count INTEGER NOT NULL,
-                recorded_date DATE NOT NULL,
-                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (gif_id) REFERENCES gifs(gif_id),
-                UNIQUE(gif_id, recorded_date)
-            )
-        ''')
-        
-        # Create indexes for faster queries
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_gif_id ON gifs(gif_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_channel_id ON gifs(channel_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_view_history_gif_date ON view_history(gif_id, recorded_date)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_view_history_date ON view_history(recorded_date)')
-        
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Warning: Database initialization failed: {str(e)}")
-        print("App will continue but database features may not work.")
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Table for channels/users
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id TEXT UNIQUE NOT NULL,
+            username TEXT,
+            user_id TEXT,
+            display_name TEXT,
+            profile_url TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Table for GIFs
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS gifs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gif_id TEXT UNIQUE NOT NULL,
+            channel_id TEXT NOT NULL,
+            title TEXT,
+            url TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
+        )
+    ''')
+    
+    # Table for view history (daily tracking)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS view_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gif_id TEXT NOT NULL,
+            view_count INTEGER NOT NULL,
+            recorded_date DATE NOT NULL,
+            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (gif_id) REFERENCES gifs(gif_id),
+            UNIQUE(gif_id, recorded_date)
+        )
+    ''')
+    
+    # Create indexes for faster queries
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_gif_id ON gifs(gif_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_channel_id ON gifs(channel_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_view_history_gif_date ON view_history(gif_id, recorded_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_view_history_date ON view_history(recorded_date)')
+    
+    conn.commit()
+    conn.close()
 
-# Initialize database on startup (non-blocking)
-try:
-    init_database()
-except Exception as e:
-    print(f"Warning: Could not initialize database on startup: {str(e)}")
+# Initialize database on startup
+init_database()
 
 # Set up alternative detection methods if available
 if ALTERNATIVE_METHODS_AVAILABLE:
@@ -116,170 +105,6 @@ PROXY_CONFIGS = {
     # Example format: 'http://username:password@proxy.example.com:8080'
     # Or: 'socks5://proxy.example.com:1080'
 }
-
-# Webshare.io proxy endpoint
-WEBSHARE_PROXY_URL = 'https://proxy.webshare.io/api/v2/proxy/list/download/udwfudvitnexkrcjvlaohdjokseeczykepovencc/-/any/username/direct/-/'
-
-# Proxy Manager Class
-class ProxyManager:
-    """
-    Manages proxy pool from webshare.io and provides proxy rotation.
-    """
-    def __init__(self, proxy_url=None):
-        self.proxy_url = proxy_url or WEBSHARE_PROXY_URL
-        self.proxy_list = []
-        self.current_index = 0
-        self.last_fetch_time = None
-        self.fetch_interval = 3600  # Refresh proxies every hour
-        self.lock = threading.Lock()
-        self.failed_proxies = set()  # Track failed proxies to avoid retrying immediately
-        
-    def fetch_proxies(self):
-        """Fetch proxy list from webshare.io endpoint"""
-        try:
-            print("Fetching proxies from webshare.io...")
-            # Use a short timeout and no proxy for fetching the proxy list itself
-            response = requests.get(self.proxy_url, timeout=10, proxies=None)
-            if response.status_code == 200:
-                # Parse proxy list (format: ip:port:username:password per line)
-                proxies = []
-                for line in response.text.strip().split('\n'):
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        parts = line.split(':')
-                        if len(parts) >= 2:
-                            ip = parts[0]
-                            port = parts[1]
-                            if len(parts) >= 4:
-                                username = parts[2]
-                                password = parts[3]
-                                proxy_url = f"http://{username}:{password}@{ip}:{port}"
-                            else:
-                                proxy_url = f"http://{ip}:{port}"
-                            proxies.append(proxy_url)
-                
-                with self.lock:
-                    self.proxy_list = proxies
-                    self.last_fetch_time = datetime.now()
-                    self.current_index = 0
-                    self.failed_proxies.clear()
-                
-                if len(proxies) > 0:
-                    print(f"✓ Fetched {len(proxies)} proxies from webshare.io")
-                else:
-                    print(f"⚠ No proxies found in response (empty list)")
-                return len(proxies) > 0
-            else:
-                print(f"✗ Failed to fetch proxies: HTTP {response.status_code}")
-                return False
-        except requests.exceptions.ConnectionError as e:
-            print(f"✗ Connection error fetching proxies: {str(e)[:100]}")
-            print("  → Will continue without proxies (direct connection)")
-            return False
-        except requests.exceptions.Timeout as e:
-            print(f"✗ Timeout fetching proxies: {str(e)[:100]}")
-            print("  → Will continue without proxies (direct connection)")
-            return False
-        except Exception as e:
-            print(f"✗ Error fetching proxies: {str(e)[:100]}")
-            print("  → Will continue without proxies (direct connection)")
-            return False
-    
-    def get_proxy(self, exclude_failed=True):
-        """
-        Get next proxy from pool with rotation.
-        
-        Args:
-            exclude_failed: If True, skip proxies that recently failed
-            
-        Returns:
-            Proxy URL string or None if no proxies available
-        """
-        with self.lock:
-            # Refresh proxies if needed
-            if not self.proxy_list or (self.last_fetch_time and 
-                (datetime.now() - self.last_fetch_time).total_seconds() > self.fetch_interval):
-                # Try to fetch proxies, but don't block if it fails
-                try:
-                    self.fetch_proxies()
-                except:
-                    pass  # Continue with existing proxies or None
-            
-            if not self.proxy_list:
-                return None
-            
-            # Try to get a proxy that hasn't failed recently
-            attempts = 0
-            max_attempts = len(self.proxy_list)
-            
-            while attempts < max_attempts:
-                proxy = self.proxy_list[self.current_index]
-                self.current_index = (self.current_index + 1) % len(self.proxy_list)
-                
-                if not exclude_failed or proxy not in self.failed_proxies:
-                    return proxy
-                
-                attempts += 1
-            
-            # If all proxies failed, return one anyway and clear failed list
-            if self.failed_proxies:
-                self.failed_proxies.clear()
-                return self.proxy_list[self.current_index]
-            
-            return None
-    
-    def mark_proxy_failed(self, proxy):
-        """Mark a proxy as failed (will be excluded temporarily)"""
-        with self.lock:
-            self.failed_proxies.add(proxy)
-    
-    def get_proxies_dict(self, proxy_url=None):
-        """
-        Get proxy formatted for requests library.
-        
-        Args:
-            proxy_url: Optional proxy URL, if None uses rotation
-            
-        Returns:
-            Dictionary with 'http' and 'https' keys, or None
-        """
-        if proxy_url is None:
-            proxy_url = self.get_proxy()
-        
-        if proxy_url:
-            return {
-                'http': proxy_url,
-                'https': proxy_url
-            }
-        return None
-    
-    def test_proxy(self, proxy_url, test_url='https://httpbin.org/ip', timeout=5):
-        """
-        Test if a proxy is working.
-        
-        Args:
-            proxy_url: Proxy URL to test
-            test_url: URL to test against
-            timeout: Request timeout
-            
-        Returns:
-            True if proxy works, False otherwise
-        """
-        try:
-            proxies = self.get_proxies_dict(proxy_url)
-            response = requests.get(test_url, proxies=proxies, timeout=timeout)
-            return response.status_code == 200
-        except:
-            return False
-
-# Initialize global proxy manager
-proxy_manager = ProxyManager()
-# Fetch proxies on startup (non-blocking - will retry if fails)
-try:
-    proxy_manager.fetch_proxies()
-except Exception as e:
-    print(f"Warning: Could not fetch proxies on startup: {str(e)}")
-    print("Proxy manager will retry when first proxy is needed.")
 
 # Alternative: Use VPN services or proxy rotation services
 # You can also use services like Bright Data, Oxylabs, etc.
@@ -339,7 +164,7 @@ def get_gif_url_from_db(gif_id):
     except:
         return None
 
-def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=None, use_proxy_manager=True):
+def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=None):
     """
     Scrape actual view count from a Giphy GIF page using a proxy.
     First tries Giphy API detail endpoint, then falls back to HTML scraping.
@@ -347,36 +172,17 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
     
     Args:
         gif_id: Giphy GIF ID
-        proxy: Proxy URL to use (e.g., 'http://proxy:port'). If None and use_proxy_manager=True, uses proxy manager rotation
+        proxy: Proxy URL to use (e.g., 'http://proxy:port')
         location: Location identifier for logging (e.g., 'india', 'usa')
         gif_url: Optional full GIF URL from API (more reliable than constructing)
-        use_proxy_manager: If True, uses proxy manager for automatic proxy rotation
     """
-    current_proxy = proxy
-    current_proxy_url = None
-    
-    # Get proxy from manager if not provided and manager is enabled
-    if use_proxy_manager and proxy is None:
-        current_proxy_url = proxy_manager.get_proxy()
-        if current_proxy_url:
-            current_proxy = current_proxy_url
-    
     try:
         # Method 0: Try Giphy API detail endpoint first (fastest and most reliable)
         if GIPHY_API_KEY and GIPHY_API_KEY != 'dc6zaTOxFJmzC':
             try:
                 gif_detail_url = f"{GIPHY_API_BASE}/gifs/{gif_id}"
                 gif_detail_params = {'api_key': GIPHY_API_KEY}
-                
-                # Use proxy for API call if available
-                api_proxies = None
-                if current_proxy:
-                    api_proxies = proxy_manager.get_proxies_dict(current_proxy) if use_proxy_manager else {
-                        'http': current_proxy,
-                        'https': current_proxy
-                    }
-                
-                gif_detail_response = requests.get(gif_detail_url, params=gif_detail_params, proxies=api_proxies, timeout=5)
+                gif_detail_response = requests.get(gif_detail_url, params=gif_detail_params, timeout=5)
                 
                 if gif_detail_response.status_code == 200:
                     gif_detail = gif_detail_response.json().get('data', {})
@@ -389,14 +195,6 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                                 return views_int
                         except:
                             pass
-            except requests.exceptions.ProxyError as e:
-                # Mark proxy as failed if using proxy manager
-                if use_proxy_manager and current_proxy_url:
-                    proxy_manager.mark_proxy_failed(current_proxy_url)
-                    # Try again with a different proxy
-                    current_proxy_url = proxy_manager.get_proxy()
-                    if current_proxy_url:
-                        current_proxy = current_proxy_url
             except Exception as e:
                 # API failed, continue to HTML scraping
                 pass
@@ -433,37 +231,20 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
             'Upgrade-Insecure-Requests': '1'
         }
         
-        # Get proxies dict
         proxies = None
-        if current_proxy:
-            if use_proxy_manager:
-                proxies = proxy_manager.get_proxies_dict(current_proxy)
-            else:
-                proxies = {
-                    'http': current_proxy,
-                    'https': current_proxy
-                }
+        if proxy:
+            proxies = {
+                'http': proxy,
+                'https': proxy
+            }
         
         # Try each URL until one works
-        max_retries = 2 if use_proxy_manager and current_proxy else 1
-        for retry in range(max_retries):
-            for test_url in url_to_try:
-                try:
-                    response = requests.get(test_url, headers=headers, proxies=proxies, timeout=15, allow_redirects=True)
-                except requests.exceptions.ProxyError as e:
-                    # Mark proxy as failed and try with a new one
-                    if use_proxy_manager and current_proxy_url and retry < max_retries - 1:
-                        proxy_manager.mark_proxy_failed(current_proxy_url)
-                        current_proxy_url = proxy_manager.get_proxy()
-                        if current_proxy_url:
-                            current_proxy = current_proxy_url
-                            proxies = proxy_manager.get_proxies_dict(current_proxy_url)
-                            continue
-                    print(f"  [{location}] Proxy error for {test_url}: {str(e)[:50]}")
-                    continue
-                except Exception as e:
-                    print(f"  [{location}] Request error for {test_url}: {str(e)[:50]}")
-                    continue  # Try next URL
+        for test_url in url_to_try:
+            try:
+                response = requests.get(test_url, headers=headers, proxies=proxies, timeout=15, allow_redirects=True)
+            except Exception as e:
+                print(f"  [{location}] Request error for {test_url}: {str(e)[:50]}")
+                continue  # Try next URL
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
@@ -729,15 +510,14 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
     
     return None
 
-def check_views_multiple_locations(gif_id, sample_count=3, use_proxy_manager=True):
+def check_views_multiple_locations(gif_id, sample_count=3):
     """
-    Check view counts from multiple locations/proxies to get accurate data.
+    Check view counts from multiple locations (India, USA) to get accurate data.
     Returns a dictionary with view counts from different locations.
     
     Args:
         gif_id: Giphy GIF ID
         sample_count: Number of samples to take (checks multiple times for accuracy)
-        use_proxy_manager: If True, uses proxy manager for automatic proxy rotation
     """
     results = {
         'gif_id': gif_id,
@@ -749,51 +529,42 @@ def check_views_multiple_locations(gif_id, sample_count=3, use_proxy_manager=Tru
     
     location_views = {
         'default': [],
-        'proxy_pool': []
+        'india': [],
+        'usa': []
     }
     
-    # Check from default location (no proxy) - always do this first
+    # Check from default location (no proxy)
     print(f"Checking views for GIF {gif_id}...")
     for i in range(sample_count):
-        views = scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', use_proxy_manager=False)
+        views = scrape_gif_views_with_proxy(gif_id, proxy=None, location='default')
         if views is not None:
             location_views['default'].append(views)
         if i < sample_count - 1:
             time.sleep(1)  # Small delay between requests
     
-    # Use proxy manager to check from multiple proxies
-    if use_proxy_manager:
-        print(f"  Checking from proxy pool (webshare.io)...")
-        for i in range(sample_count * 2):  # Check more times with proxies for better coverage
-            views = scrape_gif_views_with_proxy(gif_id, proxy=None, location=f'proxy_{i+1}', use_proxy_manager=True)
-            if views is not None:
-                location_views['proxy_pool'].append(views)
-            if i < sample_count * 2 - 1:
-                time.sleep(0.5)  # Smaller delay for proxy requests
-    
-    # Check from India proxy (if configured in PROXY_CONFIGS)
+    # Check from India proxy (if configured)
     if PROXY_CONFIGS.get('india'):
         print(f"  Checking from India proxy...")
         for i in range(sample_count):
-            views = scrape_gif_views_with_proxy(gif_id, proxy=PROXY_CONFIGS['india'], location='india', use_proxy_manager=False)
+            views = scrape_gif_views_with_proxy(gif_id, proxy=PROXY_CONFIGS['india'], location='india')
             if views is not None:
-                if 'india' not in location_views:
-                    location_views['india'] = []
                 location_views['india'].append(views)
             if i < sample_count - 1:
                 time.sleep(1)
+    else:
+        print(f"  India proxy not configured, skipping...")
     
-    # Check from USA proxy (if configured in PROXY_CONFIGS)
+    # Check from USA proxy (if configured)
     if PROXY_CONFIGS.get('usa'):
         print(f"  Checking from USA proxy...")
         for i in range(sample_count):
-            views = scrape_gif_views_with_proxy(gif_id, proxy=PROXY_CONFIGS['usa'], location='usa', use_proxy_manager=False)
+            views = scrape_gif_views_with_proxy(gif_id, proxy=PROXY_CONFIGS['usa'], location='usa')
             if views is not None:
-                if 'usa' not in location_views:
-                    location_views['usa'] = []
                 location_views['usa'].append(views)
             if i < sample_count - 1:
                 time.sleep(1)
+    else:
+        print(f"  USA proxy not configured, skipping...")
     
     # Calculate averages for each location
     for location, views_list in location_views.items():
@@ -1348,7 +1119,7 @@ def get_channel_total_views_48_hours_ago(channel_id):
     conn.close()
     return total_views, earliest_timestamp
 
-def fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=True, use_proxies=True):
+def fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=True):
     """
     Fetch current views from Giphy API for all GIFs in a channel in REAL-TIME.
     This is the only way to get views - API only provides current views, not historical.
@@ -1357,7 +1128,6 @@ def fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=True, use_
         channel_id: Channel ID
         gif_ids: List of GIF IDs to fetch views for
         store_in_db: If True, stores views in database. If False, only returns current views (real-time only).
-        use_proxies: If True, uses proxy rotation for API calls
     
     Returns:
         Dictionary with total_views, individual GIF views, and count of successfully fetched GIFs
@@ -1371,65 +1141,16 @@ def fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=True, use_
     today = datetime.now().date()
     
     mode = "real-time" if not store_in_db else "with storage"
-    proxy_mode = "with proxy rotation" if use_proxies else "direct"
-    print(f"  Fetching CURRENT views from Giphy API ({mode}, {proxy_mode}) for {len(gif_ids)} GIFs...")
+    print(f"  Fetching CURRENT views from Giphy API ({mode}) for {len(gif_ids)} GIFs...")
     
     for gif_id in gif_ids:
         try:
             # Fetch from API (REAL-TIME)
             gif_detail_url = f"{GIPHY_API_BASE}/gifs/{gif_id}"
             gif_detail_params = {'api_key': GIPHY_API_KEY}
+            gif_detail_response = requests.get(gif_detail_url, params=gif_detail_params, timeout=5)
             
-            # Get proxy for this request if enabled
-            proxies = None
-            current_proxy_url = None
-            if use_proxies:
-                current_proxy_url = proxy_manager.get_proxy()
-                if current_proxy_url:
-                    proxies = proxy_manager.get_proxies_dict(current_proxy_url)
-            
-            gif_detail_response = None
-            try:
-                gif_detail_response = requests.get(gif_detail_url, params=gif_detail_params, proxies=proxies, timeout=5)
-            except (requests.exceptions.ProxyError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                # Mark proxy as failed and retry without proxy or with new proxy
-                if use_proxies and current_proxy_url:
-                    proxy_manager.mark_proxy_failed(current_proxy_url)
-                    # Try with a new proxy (max 2 retries)
-                    for retry in range(2):
-                        current_proxy_url = proxy_manager.get_proxy()
-                        if current_proxy_url:
-                            proxies = proxy_manager.get_proxies_dict(current_proxy_url)
-                            try:
-                                gif_detail_response = requests.get(gif_detail_url, params=gif_detail_params, proxies=proxies, timeout=5)
-                                break  # Success, exit retry loop
-                            except (requests.exceptions.ProxyError, requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-                                proxy_manager.mark_proxy_failed(current_proxy_url)
-                                if retry == 1:  # Last retry failed, try without proxy
-                                    try:
-                                        proxies = None
-                                        gif_detail_response = requests.get(gif_detail_url, params=gif_detail_params, timeout=5)
-                                        break
-                                    except:
-                                        gif_detail_response = None
-                        else:
-                            # No more proxies, try without proxy
-                            try:
-                                proxies = None
-                                gif_detail_response = requests.get(gif_detail_url, params=gif_detail_params, timeout=5)
-                                break
-                            except:
-                                gif_detail_response = None
-                                break
-                else:
-                    # No proxy was used or proxy failed, try direct connection
-                    try:
-                        proxies = None
-                        gif_detail_response = requests.get(gif_detail_url, params=gif_detail_params, timeout=5)
-                    except:
-                        gif_detail_response = None
-            
-            if gif_detail_response and gif_detail_response.status_code == 200:
+            if gif_detail_response.status_code == 200:
                 gif_detail = gif_detail_response.json().get('data', {})
                 views = gif_detail.get('views')
                 
@@ -1448,15 +1169,10 @@ def fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=True, use_
                             print(f"    ✓ {gif_id[:12]}...: {views_int:,} views (from API - {mode})")
                     except (ValueError, TypeError):
                         pass
-            elif gif_detail_response:
-                print(f"    ✗ {gif_id[:12]}...: API returned {gif_detail_response.status_code}")
             else:
-                print(f"    ✗ {gif_id[:12]}...: Connection failed (proxy or network error)")
+                print(f"    ✗ {gif_id[:12]}...: API returned {gif_detail_response.status_code}")
         except Exception as e:
-            error_msg = str(e)[:100]  # Show more of the error message
-            print(f"    ✗ {gif_id[:12]}...: Error - {error_msg}")
-            # Continue to next GIF instead of failing completely
-            continue
+            print(f"    ✗ {gif_id[:12]}...: Error - {str(e)[:50]}")
         
         # Small delay to avoid rate limiting
         time.sleep(0.2)
@@ -1474,11 +1190,7 @@ def fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=True, use_
     }
 
 # Lightweight cache file for real-time comparison (no database needed)
-# Use /tmp on Vercel (serverless) for writable filesystem, otherwise use local file
-if os.path.exists('/tmp'):
-    CACHE_FILE = os.environ.get('CACHE_PATH', '/tmp/channel_views_cache.json')
-else:
-    CACHE_FILE = 'channel_views_cache.json'
+CACHE_FILE = 'channel_views_cache.json'
 
 def get_cached_views(channel_id):
     """Get last cached views for a channel from lightweight JSON file"""
@@ -1494,31 +1206,26 @@ def get_cached_views(channel_id):
 
 def cache_views(channel_id, views_data):
     """Cache current views for a channel in lightweight JSON file"""
-    try:
-        cache = {}
-        if os.path.exists(CACHE_FILE):
-            try:
-                with open(CACHE_FILE, 'r') as f:
-                    cache = json.load(f)
-            except:
-                cache = {}
-        
-        cache[channel_id] = {
-            'total_views': views_data['total_views'],
-            'gif_views': views_data.get('gif_views', {}),
-            'timestamp': views_data.get('timestamp', datetime.now().isoformat()),
-            'fetched_count': views_data.get('fetched_count', 0)
-        }
-        
+    cache = {}
+    if os.path.exists(CACHE_FILE):
         try:
-            with open(CACHE_FILE, 'w') as f:
-                json.dump(cache, f, indent=2)
-        except Exception as e:
-            print(f"  Warning: Could not cache views: {e}")
-            # On Vercel, cache might not persist between invocations - this is expected
+            with open(CACHE_FILE, 'r') as f:
+                cache = json.load(f)
+        except:
+            cache = {}
+    
+    cache[channel_id] = {
+        'total_views': views_data['total_views'],
+        'gif_views': views_data.get('gif_views', {}),
+        'timestamp': views_data.get('timestamp', datetime.now().isoformat()),
+        'fetched_count': views_data.get('fetched_count', 0)
+    }
+    
+    try:
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(cache, f, indent=2)
     except Exception as e:
-        print(f"  Warning: Cache operation failed: {e}")
-        # Continue without caching - not critical for functionality
+        print(f"  Warning: Could not cache views: {e}")
 
 def get_realtime_channel_views_comparison(channel_id, gif_ids):
     """
@@ -1537,8 +1244,8 @@ def get_realtime_channel_views_comparison(channel_id, gif_ids):
             }
         }
     """
-    # Fetch current views from API (REAL-TIME, no DB storage, with proxy rotation)
-    current_data = fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=False, use_proxies=True)
+    # Fetch current views from API (REAL-TIME, no DB storage)
+    current_data = fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=False)
     
     # Get previous cached views
     previous_data = get_cached_views(channel_id)
@@ -1837,7 +1544,7 @@ def extract_channel_info_from_url(url):
     
     return None
 
-def check_channel_via_web_scraping(channel_identifier, original_url, use_proxies=True):
+def check_channel_via_web_scraping(channel_identifier, original_url):
     """Check channel status by scraping the Giphy webpage (no API key needed)"""
     results = {
         'channel_id': channel_identifier,
@@ -1864,32 +1571,9 @@ def check_channel_via_web_scraping(channel_identifier, original_url, use_proxies
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
         
-        # Get proxy for requests if enabled
-        proxies = None
-        current_proxy_url = None
-        if use_proxies:
-            current_proxy_url = proxy_manager.get_proxy()
-            if current_proxy_url:
-                proxies = proxy_manager.get_proxies_dict(current_proxy_url)
-        
         for url in url_formats:
             try:
-                try:
-                    response = requests.get(url, headers=headers, proxies=proxies, timeout=10, allow_redirects=True)
-                except requests.exceptions.ProxyError as e:
-                    # Mark proxy as failed and retry with new proxy or without proxy
-                    if use_proxies and current_proxy_url:
-                        proxy_manager.mark_proxy_failed(current_proxy_url)
-                        current_proxy_url = proxy_manager.get_proxy()
-                        if current_proxy_url:
-                            proxies = proxy_manager.get_proxies_dict(current_proxy_url)
-                            response = requests.get(url, headers=headers, proxies=proxies, timeout=10, allow_redirects=True)
-                        else:
-                            # No more proxies, try without proxy
-                            proxies = None
-                            response = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
-                    else:
-                        raise
+                response = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
                 
                 if response.status_code == 200:
                     html_content = response.text
@@ -2174,20 +1858,7 @@ def check_tags_in_search_results(tags_list, channel_id, sample_gif_ids=None):
                     'limit': 25
                 }
                 
-                # Get proxy for this request
-                proxies = None
-                current_proxy_url = proxy_manager.get_proxy()
-                if current_proxy_url:
-                    proxies = proxy_manager.get_proxies_dict(current_proxy_url)
-                
-                try:
-                    response = requests.get(search_url, params=search_params, proxies=proxies, timeout=10)
-                except requests.exceptions.ProxyError:
-                    # Retry without proxy if proxy fails
-                    if current_proxy_url:
-                        proxy_manager.mark_proxy_failed(current_proxy_url)
-                    proxies = None
-                    response = requests.get(search_url, params=search_params, timeout=10)
+                response = requests.get(search_url, params=search_params, timeout=10)
                 
                 if response.status_code == 200:
                     search_results = response.json().get('data', [])
@@ -2303,21 +1974,7 @@ def check_channel_in_search_results(channel_id, sample_gif_ids=None, all_gifs_li
                 }
                 
                 search_queries_tested.append(query)
-                
-                # Get proxy for this request
-                proxies = None
-                current_proxy_url = proxy_manager.get_proxy()
-                if current_proxy_url:
-                    proxies = proxy_manager.get_proxies_dict(current_proxy_url)
-                
-                try:
-                    response = requests.get(search_url, params=search_params, proxies=proxies, timeout=10)
-                except requests.exceptions.ProxyError:
-                    # Retry without proxy if proxy fails
-                    if current_proxy_url:
-                        proxy_manager.mark_proxy_failed(current_proxy_url)
-                    proxies = None
-                    response = requests.get(search_url, params=search_params, timeout=10)
+                response = requests.get(search_url, params=search_params, timeout=10)
                 
                 if response.status_code == 200:
                     search_results = response.json().get('data', [])
@@ -4955,49 +4612,6 @@ def get_realtime_views():
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-@app.route('/static/<path:filename>')
-def static_files(filename):
-    """Serve static files explicitly for Vercel compatibility"""
-    try:
-        # Use Flask's built-in static file serving (most reliable)
-        return app.send_static_file(filename)
-    except Exception as e:
-        print(f"Error serving static file {filename}: {str(e)}")
-        # Try alternative path resolution for Vercel
-        try:
-            # Get the absolute path to static folder
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            static_dir = os.path.join(current_dir, 'static')
-            file_path = os.path.join(static_dir, filename)
-            
-            # Security check - ensure file is within static directory
-            if not os.path.abspath(file_path).startswith(os.path.abspath(static_dir)):
-                return "Forbidden", 403
-            
-            # Check if file exists
-            if not os.path.exists(file_path):
-                return f"File not found: {filename}", 404
-            
-            # Determine content type
-            if filename.endswith('.css'):
-                content_type = 'text/css'
-            elif filename.endswith('.js'):
-                content_type = 'application/javascript'
-            else:
-                content_type = 'application/octet-stream'
-            
-            # Read and return file
-            with open(file_path, 'rb') as f:
-                content = f.read()
-            
-            from flask import Response
-            response = Response(content, mimetype=content_type)
-            response.headers['Cache-Control'] = 'public, max-age=31536000'
-            return response
-        except Exception as e2:
-            print(f"Alternative static file serving also failed: {str(e2)}")
-            return f"Error loading {filename}: {str(e2)}", 404
 
 @app.route('/')
 def index():
