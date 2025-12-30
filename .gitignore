@@ -37,6 +37,9 @@ Thumbs.db
 channel_views_cache.json
 *.cache
 
+# Vercel
+.vercel
+
 # Logs
 *.log
 

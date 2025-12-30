@@ -31,65 +31,76 @@ GIPHY_API_BASE = 'https://api.giphy.com/v1'
 USE_API = os.environ.get('USE_GIPHY_API', 'true').lower() == 'true'
 
 # Database configuration
-DB_NAME = 'giphy_tracking.db'
+# Use /tmp on Vercel (serverless) for writable filesystem, otherwise use local file
+if os.path.exists('/tmp'):
+    DB_NAME = os.environ.get('DB_PATH', '/tmp/giphy_tracking.db')
+else:
+    DB_NAME = 'giphy_tracking.db'
 
 # Initialize database
 def init_database():
     """Initialize the SQLite database with required tables"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # Table for channels/users
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS channels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            channel_id TEXT UNIQUE NOT NULL,
-            username TEXT,
-            user_id TEXT,
-            display_name TEXT,
-            profile_url TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Table for GIFs
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS gifs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            gif_id TEXT UNIQUE NOT NULL,
-            channel_id TEXT NOT NULL,
-            title TEXT,
-            url TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
-        )
-    ''')
-    
-    # Table for view history (daily tracking)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS view_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            gif_id TEXT NOT NULL,
-            view_count INTEGER NOT NULL,
-            recorded_date DATE NOT NULL,
-            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (gif_id) REFERENCES gifs(gif_id),
-            UNIQUE(gif_id, recorded_date)
-        )
-    ''')
-    
-    # Create indexes for faster queries
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_gif_id ON gifs(gif_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_channel_id ON gifs(channel_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_view_history_gif_date ON view_history(gif_id, recorded_date)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_view_history_date ON view_history(recorded_date)')
-    
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        # Table for channels/users
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT UNIQUE NOT NULL,
+                username TEXT,
+                user_id TEXT,
+                display_name TEXT,
+                profile_url TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Table for GIFs
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS gifs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                gif_id TEXT UNIQUE NOT NULL,
+                channel_id TEXT NOT NULL,
+                title TEXT,
+                url TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
+            )
+        ''')
+        
+        # Table for view history (daily tracking)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS view_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                gif_id TEXT NOT NULL,
+                view_count INTEGER NOT NULL,
+                recorded_date DATE NOT NULL,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (gif_id) REFERENCES gifs(gif_id),
+                UNIQUE(gif_id, recorded_date)
+            )
+        ''')
+        
+        # Create indexes for faster queries
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_gif_id ON gifs(gif_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_channel_id ON gifs(channel_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_view_history_gif_date ON view_history(gif_id, recorded_date)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_view_history_date ON view_history(recorded_date)')
+        
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Warning: Database initialization failed: {str(e)}")
+        print("App will continue but database features may not work.")
 
-# Initialize database on startup
-init_database()
+# Initialize database on startup (non-blocking)
+try:
+    init_database()
+except Exception as e:
+    print(f"Warning: Could not initialize database on startup: {str(e)}")
 
 # Set up alternative detection methods if available
 if ALTERNATIVE_METHODS_AVAILABLE:
