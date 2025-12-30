@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Giphy Channel Status Checker</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎬 Giphy Channel Status Dashboard</h1>
+            <p class="subtitle">Check if your Giphy channel is shadow banned, banned, or working</p>
+        </header>
+
+        <div class="dashboard">
+            <div class="input-section">
+                <div class="input-group">
+                    <label for="giphy-url">Enter Giphy Channel URL:</label>
+                    <input 
+                        type="text" 
+                        id="giphy-url" 
+                        placeholder="https://giphy.com/username or https://giphy.com/channel/username"
+                        autocomplete="off"
+                    >
+                    <button id="check-btn" onclick="checkChannel()">
+                        <span id="btn-text">Check Status</span>
+                        <span id="btn-loader" class="loader" style="display: none;"></span>
+                    </button>
+                </div>
+                <div class="examples">
+                    <p>Examples:</p>
+                    <ul>
+                        <li>https://giphy.com/username</li>
+                        <li>https://giphy.com/channel/username</li>
+                        <li>https://giphy.com/@username</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div id="results-section" class="results-section" style="display: none;">
+                <div class="status-card">
+                    <div id="status-badge" class="status-badge">
+                        <span id="status-icon"></span>
+                        <span id="status-text">Checking...</span>
+                    </div>
+                </div>
+
+                <div class="details-grid">
+                    <div class="detail-card">
+                        <h3>Channel Information</h3>
+                        <div id="channel-info" class="info-content"></div>
+                    </div>
+
+                    <div class="detail-card" id="status-details-card" style="display: none;">
+                        <h3>Status Details</h3>
+                        <div id="status-details" class="info-content"></div>
+                    </div>
+
+                    <div class="detail-card">
+                        <h3>Status</h3>
+                        <div id="detection-results" class="info-content"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="error-section" class="error-section" style="display: none;">
+                <div class="error-card">
+                    <span class="error-icon">⚠️</span>
+                    <p id="error-message"></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
+
