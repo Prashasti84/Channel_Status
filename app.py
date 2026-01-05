@@ -11,6 +11,7 @@ import os
 from bs4 import BeautifulSoup
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
 
 # Import alternative detection methods (will be set up after API config is defined)
 ALTERNATIVE_METHODS_AVAILABLE = False
@@ -41,7 +42,13 @@ else:
 # Initialize database
 def init_database():
     """Initialize the SQLite database with required tables"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=20.0)  # Increased timeout for better concurrency
+    # Enable WAL mode for better concurrent read performance
+    conn.execute('PRAGMA journal_mode=WAL')
+    # Optimize for performance
+    conn.execute('PRAGMA synchronous=NORMAL')  # Faster than FULL, still safe
+    conn.execute('PRAGMA cache_size=10000')  # Increase cache size
+    conn.execute('PRAGMA temp_store=MEMORY')  # Use memory for temp tables
     cursor = conn.cursor()
     
     # Table for channels/users
@@ -96,6 +103,18 @@ def init_database():
 # Initialize database on startup
 init_database()
 
+# Helper function for optimized database connections
+def get_db_connection():
+    """Get an optimized database connection with performance settings"""
+    conn = sqlite3.connect(DB_NAME, timeout=20.0)
+    # Enable WAL mode for better concurrent read performance
+    conn.execute('PRAGMA journal_mode=WAL')
+    # Optimize for performance
+    conn.execute('PRAGMA synchronous=NORMAL')  # Faster than FULL, still safe
+    conn.execute('PRAGMA cache_size=10000')  # Increase cache size
+    conn.execute('PRAGMA temp_store=MEMORY')  # Use memory for temp tables
+    return conn
+
 # Set up alternative detection methods if available
 if ALTERNATIVE_METHODS_AVAILABLE:
     try:
@@ -113,6 +132,1468 @@ PROXY_CONFIGS = {
 
 # Alternative: Use VPN services or proxy rotation services
 # You can also use services like Bright Data, Oxylabs, etc.
+
+# Request timeout and delay settings for channel status detection
+REQUEST_TIMEOUT = 30
+REQUEST_DELAY = 0.3  # Reduced delay between API requests in seconds (optimized for speed)
+REQUEST_DELAY_MIN = 0.1  # Minimum delay for rate limiting
+
+# Create a shared requests session for connection pooling (faster than creating new connections)
+_requests_session = requests.Session()
+_requests_session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+})
+
+# ============================================================================
+# Channel Status Detector Functions
+# Integrated from channel_status_detector.py
+# ============================================================================
+
+def fetch_channel_info(channel_username: str) -> dict:
+    """
+    Fetch channel information including total GIF count and views from GIPHY API.
+    
+    IMPORTANT: For BANNED channels, this function will return:
+    - exists: False
+    - total_gifs: 0 (API cannot fetch GIFs for banned channels)
+    - total_views: 0 (API cannot fetch views for banned channels)
+    
+    For SHADOW BANNED and WORKING channels, this function will return:
+    - exists: True
+    - total_gifs: actual count from API
+    - total_views: actual count from API
+    
+    Args:
+        channel_username: The channel username to check
+        
+    Returns:
+        Dictionary with channel info, total_gifs, total_views, and status
+        {
+            'exists': bool,
+            'total_gifs': int,  # 0 for banned channels, actual count for others
+            'total_views': int,  # 0 for banned channels, actual count for others
+            'user_data': dict or None,
+            'gifs_list': list or None,
+            'error': str or None
+        }
+    """
+    result = {
+        'exists': False,
+        'total_gifs': 0,
+        'total_views': 0,
+        'user_data': None,
+        'gifs_list': [],
+        'error': None
+    }
+    
+    try:
+        # Step 1: Try to fetch GIFs by username first (more reliable than user endpoint)
+        # Many channels exist but aren't accessible via /users endpoint
+        gifs_url = f"{GIPHY_API_BASE}/gifs/search"
+        all_gifs = []
+        offset = 0
+        limit = 50  # Maximum per request
+        max_pages = 20  # Fetch up to 1000 GIFs
+        
+        print(f"Fetching GIFs for channel: {channel_username}")
+        
+        # Try different case variants (API usernames are case-sensitive)
+        # e.g., "bloomscroll" URL might need "Bloomscroll" in API
+        # e.g., "vibleai" URL might need "vibleAI" in API
+        # e.g., "GifStudios_" URL has underscore as part of username
+        username_variants = [
+            channel_username,  # Try as-is first
+            channel_username.capitalize(),  # Try capitalized (e.g., "bloomscroll" -> "Bloomscroll")
+            channel_username.title(),  # Try title case
+        ]
+        
+        # Handle trailing underscores - generate variants with and without
+        # Some usernames have underscore as part of username (e.g., GifStudios_)
+        if channel_username.endswith('_'):
+            # Add variant without trailing underscore
+            username_no_underscore = channel_username[:-1]
+            if username_no_underscore not in username_variants:
+                username_variants.append(username_no_underscore)
+                username_variants.append(username_no_underscore.capitalize())
+                username_variants.append(username_no_underscore.title())
+        else:
+            # Add variant with trailing underscore (in case API expects it)
+            username_with_underscore = channel_username + '_'
+            if username_with_underscore not in username_variants:
+                username_variants.append(username_with_underscore)
+        
+        # Try common patterns for usernames with suffixes
+        # If username ends with lowercase letters, try capitalizing the suffix
+        # e.g., "vibleai" -> "vibleAI", "appname" -> "appName"
+        if len(channel_username) > 2:
+            # Try capitalizing last 2-3 characters (common for "AI", "App", "TV", etc.)
+            for suffix_len in [2, 3]:
+                if len(channel_username) > suffix_len:
+                    prefix = channel_username[:-suffix_len]
+                    suffix = channel_username[-suffix_len:].upper()
+                    variant = prefix + suffix
+                    username_variants.append(variant)
+            
+            # Try capitalizing each word if it looks like multiple words
+            # e.g., "vibleai" -> "VibleAI" (if it's "vible" + "ai")
+            if any(c.isupper() for c in channel_username):
+                # Already has uppercase, try as-is variations
+                pass
+            else:
+                # Try splitting on common patterns and capitalizing
+                # For "vibleai", try "VibleAI"
+                if len(channel_username) >= 4:
+                    # Try splitting at various points
+                    for split_point in range(1, len(channel_username)):
+                        part1 = channel_username[:split_point].capitalize()
+                        part2 = channel_username[split_point:].upper()
+                        variant = part1 + part2
+                        username_variants.append(variant)
+        
+        # Remove duplicates while preserving order
+        username_variants = list(dict.fromkeys(username_variants))
+        print(f"  Trying {len(username_variants)} username variants: {username_variants[:5]}...")
+        
+        username_found = None
+        for username_variant in username_variants:
+            # Try Method 1: Search with username parameter
+            offset = 0
+            variant_gifs = []
+            
+            for page in range(max_pages):
+                gifs_params = {
+                    'api_key': GIPHY_API_KEY,
+                    'q': '',  # Empty query to get all from user
+                    'username': username_variant,
+                    'limit': limit,
+                    'offset': offset
+                }
+                
+                gifs_response = _requests_session.get(gifs_url, params=gifs_params, timeout=REQUEST_TIMEOUT)
+                
+                if gifs_response.status_code == 200:
+                    gifs_data = gifs_response.json().get('data', [])
+                    if not gifs_data:
+                        break
+                    
+                    variant_gifs.extend(gifs_data)
+                    result['exists'] = True  # If we got GIFs, channel exists
+                    
+                    # If we got fewer than limit, we've reached the end
+                    if len(gifs_data) < limit:
+                        break
+                    
+                    offset += limit
+                    time.sleep(REQUEST_DELAY_MIN)  # Reduced delay for faster execution
+                elif gifs_response.status_code == 404:
+                    break  # No GIFs found with this username variant
+                else:
+                    break  # Some error, try next variant
+            
+            # If we found GIFs with this variant, verify they belong to the channel
+            if len(variant_gifs) > 0:
+                # Verify all GIFs actually belong to this channel
+                verified_gifs = []
+                channel_username_lower = channel_username.lower()
+                username_variant_lower = username_variant.lower()
+                
+                for gif in variant_gifs:
+                    gif_user = gif.get('user', {})
+                    gif_username = gif_user.get('username', '').lower() if gif_user.get('username') else ''
+                    
+                    # Verify username matches
+                    if (gif_username == channel_username_lower or 
+                        gif_username == username_variant_lower or
+                        gif_username in [v.lower() for v in username_variants]):
+                        verified_gifs.append(gif)
+                    else:
+                        print(f"    ⚠️  Skipping GIF {gif.get('id', 'unknown')} - username mismatch: {gif_username} != {channel_username_lower}")
+                
+                if len(verified_gifs) > 0:
+                    username_found = username_variant
+                    all_gifs = verified_gifs
+                    print(f"  Found {len(all_gifs)} verified GIFs with username: {username_variant}")
+                    
+                    # Extract user info from first GIF if available
+                    if not result['user_data']:
+                        first_gif = all_gifs[0]
+                        user_from_gif = first_gif.get('user')
+                        if user_from_gif:
+                            result['user_data'] = user_from_gif
+                            # Use the actual username from API response
+                            actual_username = user_from_gif.get('username', username_variant)
+                            print(f"[OK] Channel exists: Found {len(all_gifs)} GIFs (username: {actual_username})")
+                    break  # Found GIFs, no need to try other variants
+                else:
+                    print(f"  ⚠️  Found GIFs but none verified as belonging to channel '{channel_username}'")
+                    # Continue to next variant
+        
+        # Method 2: Try direct user endpoint with all username variants to get actual username
+        if len(all_gifs) == 0:
+            print(f"  Username parameter didn't work, trying direct user endpoint...")
+            actual_username_from_api = None
+            for username_variant in username_variants:
+                try:
+                    user_url = f"{GIPHY_API_BASE}/users/{username_variant}"
+                    user_params = {'api_key': GIPHY_API_KEY}
+                    user_response = _requests_session.get(user_url, params=user_params, timeout=REQUEST_TIMEOUT)
+                    
+                    if user_response.status_code == 200:
+                        user_data = user_response.json().get('data', {})
+                        if user_data:
+                            result['user_data'] = user_data
+                            actual_username_from_api = user_data.get('username', username_variant)
+                            print(f"  Found user via endpoint: {actual_username_from_api}")
+                            break
+                except:
+                    pass
+            
+            # If we found the actual username, retry fetching GIFs with it
+            if actual_username_from_api and actual_username_from_api not in username_variants:
+                print(f"  Retrying GIF fetch with actual username: {actual_username_from_api}")
+                offset = 0
+                retry_gifs = []
+                for page in range(max_pages):
+                    gifs_params = {
+                        'api_key': GIPHY_API_KEY,
+                        'q': '',
+                        'username': actual_username_from_api,
+                        'limit': limit,
+                        'offset': offset
+                    }
+                    
+                    gifs_response = _requests_session.get(gifs_url, params=gifs_params, timeout=REQUEST_TIMEOUT)
+                    
+                    if gifs_response.status_code == 200:
+                        gifs_data = gifs_response.json().get('data', [])
+                        if not gifs_data:
+                            break
+                        
+                        # Verify GIFs belong to the channel
+                        actual_username_lower = actual_username_from_api.lower()
+                        for gif in gifs_data:
+                            gif_user = gif.get('user', {})
+                            gif_username = gif_user.get('username', '').lower() if gif_user.get('username') else ''
+                            if gif_username == actual_username_lower:
+                                retry_gifs.append(gif)
+                        
+                        if len(gifs_data) < limit:
+                            break
+                        
+                        offset += limit
+                        time.sleep(REQUEST_DELAY_MIN)
+                    else:
+                        break
+                
+                if len(retry_gifs) > 0:
+                    all_gifs = retry_gifs
+                    result['exists'] = True
+                    print(f"  Found {len(all_gifs)} verified GIFs with actual username: {actual_username_from_api}")
+                    # user_data is already set in result['user_data'] above
+                else:
+                    print(f"  ⚠️  No verified GIFs found with actual username: {actual_username_from_api}")
+        
+        # Method 3: If username parameter didn't work, try searching by channel name
+        # and filter results by username
+        if len(all_gifs) == 0:
+            print(f"  Direct user endpoint didn't work, trying search query method...")
+            offset = 0
+            
+            for page in range(max_pages):
+                gifs_params = {
+                    'api_key': GIPHY_API_KEY,
+                    'q': channel_username,  # Use channel name as search query
+                    'limit': limit,
+                    'offset': offset
+                }
+                
+                gifs_response = _requests_session.get(gifs_url, params=gifs_params, timeout=REQUEST_TIMEOUT)
+                
+                if gifs_response.status_code == 200:
+                    gifs_data = gifs_response.json().get('data', [])
+                    if not gifs_data:
+                        break
+                    
+                    # Filter GIFs by username - STRICT MATCHING ONLY
+                    # For search query method, we need EXACT username match to avoid false positives
+                    # (e.g., searching "brunch" finds GIFs from many channels, not just "Brunch-us")
+                    channel_username_lower = channel_username.lower()
+                    username_variants_lower = [v.lower() for v in username_variants]
+                    filtered_gifs = []
+                    for gif in gifs_data:
+                        gif_user = gif.get('user', {})
+                        if not gif_user:
+                            continue  # Skip GIFs without user info
+                        
+                        gif_username = gif_user.get('username', '').lower() if gif_user.get('username') else ''
+                        gif_display_name = gif_user.get('display_name', '').lower() if gif_user.get('display_name') else ''
+                        
+                        # STRICT MATCHING: Only accept EXACT matches or very close matches
+                        # This prevents matching GIFs from other channels that happen to have similar names
+                        matches = False
+                        
+                        if gif_username:
+                            # Method 1: Exact match (case-insensitive)
+                            if gif_username == channel_username_lower:
+                                matches = True
+                            # Method 2: Exact match with any username variant
+                            elif gif_username in username_variants_lower:
+                                matches = True
+                            # Method 3: Very close match - username starts with channel username or vice versa
+                            # But only if the difference is minimal (e.g., "brunch-us" vs "brunchus")
+                            elif (gif_username.startswith(channel_username_lower) or 
+                                  channel_username_lower.startswith(gif_username)):
+                                # Additional check: ensure it's not just a partial word match
+                                # e.g., "brunch" should NOT match "brunchtime" or "brunching"
+                                # But "brunch-us" should match "brunchus" (hyphen difference)
+                                diff = abs(len(gif_username) - len(channel_username_lower))
+                                if diff <= 2:  # Allow small differences (hyphens, case, etc.)
+                                    matches = True
+                        
+                        # Check display name only if username didn't match
+                        if not matches and gif_display_name:
+                            if gif_display_name == channel_username_lower:
+                                matches = True
+                            elif gif_display_name in username_variants_lower:
+                                matches = True
+                        
+                        if matches:
+                            filtered_gifs.append(gif)
+                            # Debug: print matched GIF to verify
+                            print(f"    ✓ Matched GIF {gif.get('id', 'unknown')} from user: {gif_username}")
+                    
+                    if len(filtered_gifs) > 0:
+                        all_gifs.extend(filtered_gifs)
+                        print(f"  Fetched {len(filtered_gifs)} GIFs from search (total: {len(all_gifs)})")
+                        result['exists'] = True
+                        
+                        # Extract user info from first GIF if available
+                        if not result['user_data']:
+                            first_gif = filtered_gifs[0]
+                            user_from_gif = first_gif.get('user')
+                            if user_from_gif:
+                                result['user_data'] = user_from_gif
+                                actual_username = user_from_gif.get('username', '')
+                                print(f"  Confirmed channel username from GIFs: {actual_username}")
+                    elif offset == 0:
+                        # No matching GIFs found even in first page
+                        # This means search query found GIFs but none belong to this channel
+                        print(f"  ⚠️  Search found GIFs but none belong to channel '{channel_username}'")
+                        print(f"     This likely means the channel is BANNED (no GIFs accessible via API)")
+                        break
+                    
+                    # If we got fewer than limit, we've reached the end
+                    if len(gifs_data) < limit:
+                        break
+                    
+                    offset += limit
+                    time.sleep(REQUEST_DELAY_MIN)  # Reduced delay for faster execution
+                else:
+                    break
+        
+        # Step 2: If we found GIFs, try to get user info from user endpoint (optional, for additional info)
+        if result['exists'] and len(all_gifs) > 0 and not result['user_data']:
+            try:
+                user_url = f"{GIPHY_API_BASE}/users/{channel_username}"
+                user_params = {'api_key': GIPHY_API_KEY}
+                user_response = _requests_session.get(user_url, params=user_params, timeout=REQUEST_TIMEOUT)
+                
+                if user_response.status_code == 200:
+                    user_data = user_response.json().get('data', {})
+                    result['user_data'] = user_data
+                    print(f"[OK] User info found: {user_data.get('display_name', channel_username)}")
+            except:
+                pass  # User endpoint not available, but we have GIFs so channel exists
+        
+        # If no GIFs found, channel doesn't exist or is inaccessible (BANNED)
+        if not result['exists'] or len(all_gifs) == 0:
+            result['error'] = 'Channel not found - no GIFs accessible via API (likely BANNED)'
+            result['exists'] = False
+            result['total_gifs'] = 0
+            result['total_views'] = 0
+            print(f"[X] Channel not found or BANNED: {channel_username}")
+            print(f"    No GIFs accessible via API - channel is likely BANNED")
+            return result
+        
+        # Verify that we actually found GIFs from the correct channel
+        # If search query method was used, double-check all GIFs belong to the channel
+        if len(all_gifs) > 0:
+            # Check if all GIFs have matching usernames
+            channel_username_lower = channel_username.lower()
+            username_variants_lower = [v.lower() for v in username_variants]
+            verified_gifs = []
+            for gif in all_gifs:
+                gif_user = gif.get('user', {})
+                gif_username = gif_user.get('username', '').lower() if gif_user.get('username') else ''
+                
+                # Verify this GIF belongs to the channel
+                if (gif_username == channel_username_lower or 
+                    gif_username in username_variants_lower):
+                    verified_gifs.append(gif)
+                else:
+                    print(f"    ⚠️  Skipping GIF {gif.get('id', 'unknown')} - username mismatch: {gif_username} != {channel_username_lower}")
+            
+            # If we lost GIFs during verification, update the list
+            if len(verified_gifs) < len(all_gifs):
+                print(f"  ⚠️  Verification: {len(verified_gifs)}/{len(all_gifs)} GIFs verified as belonging to channel")
+                if len(verified_gifs) == 0:
+                    # No verified GIFs - channel is likely BANNED
+                    result['exists'] = False
+                    result['error'] = 'No GIFs found that belong to this channel (likely BANNED)'
+                    result['total_gifs'] = 0
+                    result['total_views'] = 0
+                    print(f"[X] No verified GIFs - channel is BANNED")
+                    return result
+                all_gifs = verified_gifs
+        
+        result['gifs_list'] = all_gifs
+        result['total_gifs'] = len(all_gifs)
+        
+        # Step 3: Calculate total views from all GIFs
+        total_views = 0
+        for gif in all_gifs:
+            # Get views from analytics if available
+            analytics = gif.get('analytics', {})
+            onload = analytics.get('onload', {})
+            view_count = onload.get('count', 0)
+            total_views += view_count
+        
+        result['total_views'] = total_views
+        
+        print(f"[OK] Total GIFs: {result['total_gifs']}, Total Views: {result['total_views']}")
+        
+    except requests.exceptions.RequestException as e:
+        result['error'] = f'Request error: {str(e)}'
+        print(f"[X] Request error: {str(e)}")
+    except Exception as e:
+        result['error'] = f'Unexpected error: {str(e)}'
+        print(f"[X] Unexpected error: {str(e)}")
+    
+    return result
+
+
+def check_banned_channel(channel_username: str) -> dict:
+    """
+    Check if a channel is banned.
+    
+    Logic: BANNED channels will NEVER find total GIFs and total views from GIPHY API.
+    - Channel not found in API (exists = False)
+    - OR no GIFs returned (total_gifs = 0)
+    - OR no views returned (total_views = 0 AND total_gifs = 0)
+    
+    Args:
+        channel_username: The channel username to check
+        
+    Returns:
+        Dictionary with banned status and details
+        {
+            'is_banned': bool,
+            'reason': str,
+            'channel_info': dict or None
+        }
+    """
+    result = {
+        'is_banned': False,
+        'reason': None,
+        'channel_info': None
+    }
+    
+    print(f"\n{'='*60}")
+    print(f"Checking BANNED status for: {channel_username}")
+    print(f"{'='*60}")
+    
+    # Fetch channel info from GIPHY API
+    channel_info = fetch_channel_info(channel_username)
+    result['channel_info'] = channel_info
+    
+    # Ensure banned channels have 0 for total_gifs and total_views
+    total_gifs = channel_info.get('total_gifs', 0)
+    total_views = channel_info.get('total_views', 0)
+    
+    # BANNED: Channel not found in API (no GIFs accessible)
+    if not channel_info.get('exists'):
+        result['is_banned'] = True
+        result['reason'] = 'Channel not found in GIPHY API - no GIFs or views accessible'
+        # Ensure values are 0 for banned channels
+        channel_info['total_gifs'] = 0
+        channel_info['total_views'] = 0
+        print(f"[X] BANNED: Channel not found - total_gifs: 0, total_views: 0")
+        return result
+    
+    # BANNED: Channel exists but has no GIFs (API returned no GIFs)
+    if total_gifs == 0:
+        result['is_banned'] = True
+        result['reason'] = 'Channel exists but API returned no GIFs (banned)'
+        # Ensure values are 0 for banned channels
+        channel_info['total_gifs'] = 0
+        channel_info['total_views'] = 0
+        print(f"[X] BANNED: Channel has no GIFs - total_gifs: 0, total_views: 0")
+        return result
+    
+    # BANNED: Channel has GIFs but no views (unusual, but could indicate ban)
+    # Only mark as banned if both are 0
+    if total_gifs == 0 and total_views == 0:
+        result['is_banned'] = True
+        result['reason'] = 'Channel has no GIFs and no views (banned)'
+        print(f"[X] BANNED: No GIFs and no views - total_gifs: 0, total_views: 0")
+        return result
+    
+    # Check if there's an error that might indicate a ban
+    if channel_info.get('error'):
+        error_msg = channel_info.get('error', '')
+        if '404' in error_msg or '403' in error_msg or 'forbidden' in error_msg.lower():
+            result['is_banned'] = True
+            result['reason'] = f'API error indicates ban: {error_msg}'
+            # Ensure values are 0 for banned channels
+            channel_info['total_gifs'] = 0
+            channel_info['total_views'] = 0
+            print(f"[X] BANNED: {result['reason']} - total_gifs: 0, total_views: 0")
+            return result
+    
+    # If we got here, channel exists and has GIFs/views - NOT BANNED
+    # Continue to check for shadow banned or working status
+    print(f"[OK] NOT BANNED: Channel exists with {total_gifs} GIFs and {total_views:,} views")
+    result['is_banned'] = False
+    result['reason'] = 'Channel exists and has content accessible via API'
+    
+    return result
+
+
+def get_gif_tags(gif_id: str) -> list:
+    """
+    Get tags for a specific GIF.
+    Handles tags in different formats (strings or objects).
+    
+    Args:
+        gif_id: The GIF ID
+        
+    Returns:
+        List of tags associated with the GIF (as strings)
+    """
+    try:
+        gif_url = f"{GIPHY_API_BASE}/gifs/{gif_id}"
+        gif_params = {'api_key': GIPHY_API_KEY}
+        
+        response = _requests_session.get(gif_url, params=gif_params, timeout=REQUEST_TIMEOUT)
+        
+        if response.status_code == 200:
+            gif_data = response.json().get('data', {})
+            tags_raw = gif_data.get('tags', []) or []
+            
+            # Handle tags - they might be strings or objects
+            tags = []
+            if tags_raw:
+                for tag_item in tags_raw:
+                    if isinstance(tag_item, str):
+                        # Simple string tag - remove # if present and clean
+                        tag_clean = tag_item.replace('#', '').strip()
+                        if tag_clean:
+                            tags.append(tag_clean)
+                    elif isinstance(tag_item, dict):
+                        # Tags might be objects with 'text' or 'name' field
+                        tag_text = tag_item.get('text', tag_item.get('name', ''))
+                        if tag_text:
+                            tag_clean = str(tag_text).replace('#', '').strip()
+                            if tag_clean:
+                                tags.append(tag_clean)
+            
+            return tags
+        else:
+            return []
+    except Exception as e:
+        print(f"  Error fetching tags for GIF {gif_id}: {str(e)}")
+        return []
+
+
+def get_gif_tags_batch(gif_ids: list, channel_username: str = None) -> dict:
+    """
+    Fetch tags for multiple GIFs in parallel for speed.
+    Also verifies that GIFs belong to the specified channel.
+    
+    Args:
+        gif_ids: List of GIF IDs to fetch tags for
+        channel_username: Optional channel username to verify GIFs belong to this channel
+        
+    Returns:
+        Dictionary mapping gif_id -> list of tags
+    """
+    tags_dict = {}
+    channel_username_lower = channel_username.lower() if channel_username else None
+    
+    def fetch_tags_for_gif(gif_id):
+        """Fetch tags for a single GIF"""
+        try:
+            gif_url = f"{GIPHY_API_BASE}/gifs/{gif_id}"
+            gif_params = {'api_key': GIPHY_API_KEY}
+            response = _requests_session.get(gif_url, params=gif_params, timeout=REQUEST_TIMEOUT)
+            
+            if response.status_code == 200:
+                gif_data = response.json().get('data', {})
+                
+                # Verify GIF belongs to channel if channel_username provided
+                if channel_username_lower:
+                    gif_user = gif_data.get('user', {})
+                    gif_username = gif_user.get('username', '').lower() if gif_user.get('username') else ''
+                    if gif_username != channel_username_lower:
+                        return None  # GIF doesn't belong to this channel
+                
+                tags_raw = gif_data.get('tags', []) or []
+                tags = []
+                if tags_raw:
+                    for tag_item in tags_raw:
+                        if isinstance(tag_item, str):
+                            tag_clean = tag_item.replace('#', '').strip()
+                            if tag_clean:
+                                tags.append(tag_clean)
+                        elif isinstance(tag_item, dict):
+                            tag_text = tag_item.get('text', tag_item.get('name', ''))
+                            if tag_text:
+                                tag_clean = str(tag_text).replace('#', '').strip()
+                                if tag_clean:
+                                    tags.append(tag_clean)
+                return (gif_id, tags)
+            return None
+        except Exception as e:
+            return None
+    
+    # Fetch tags in parallel (up to 15 at a time for speed - optimized)
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        futures = {executor.submit(fetch_tags_for_gif, gif_id): gif_id for gif_id in gif_ids}
+        
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                gif_id, tags = result
+                tags_dict[gif_id] = tags
+    
+    return tags_dict
+
+
+def check_channel_gifs_in_search_results(search_query: str, channel_username: str, max_results: int = 2500) -> bool:
+    """
+    Check if ANY GIF from a channel appears in search results for a given query/tag.
+    This is more reliable than checking specific GIFs - if any GIF from the channel
+    is visible in search, the channel is working.
+    
+    Args:
+        search_query: The search query/tag to use
+        channel_username: Channel username to check for GIFs from this channel
+        max_results: Maximum number of results to check (default 2500, checks multiple pages)
+        
+    Returns:
+        True if ANY GIF from the channel is found in search results, False otherwise
+    """
+    try:
+        search_url = f"{GIPHY_API_BASE}/gifs/search"
+        limit = 100  # API limit per request (matches JavaScript)
+        offset = 0
+        max_offset = 2400  # Search up to 2500 results (2400 + 100) - matches JavaScript logic
+        
+        # Normalize channel username for comparison
+        channel_username_lower = channel_username.lower() if channel_username else None
+        
+        if not channel_username_lower:
+            return False
+        
+        while offset <= max_offset:
+            # Build search params - only 'relevant' sort (default, no sort parameter)
+            search_params = {
+                'api_key': GIPHY_API_KEY,
+                'q': search_query,
+                'limit': limit,
+                'offset': offset
+                # No sort parameter = 'relevant' (default)
+            }
+            
+            response = _requests_session.get(search_url, params=search_params, timeout=REQUEST_TIMEOUT)
+            
+            if response.status_code == 200:
+                response_data = response.json()
+                search_results = response_data.get('data', [])
+                pagination = response_data.get('pagination', {})
+                total_count = pagination.get('total_count', 0)
+                
+                if not search_results:
+                    # No data returned, but continue searching if we haven't reached maxOffset
+                    if offset < max_offset:
+                        offset += limit
+                        continue
+                    else:
+                        break
+                
+                # Check if ANY GIF from the channel is in the results
+                for index, gif in enumerate(search_results):
+                    gif_user = gif.get('user')
+                    
+                    # Handle both dict and None cases
+                    if gif_user and isinstance(gif_user, dict):
+                        gif_username = gif_user.get('username', '').lower() if gif_user.get('username') else ''
+                        gif_display_name = gif_user.get('display_name', '').lower() if gif_user.get('display_name') else ''
+                        
+                        # Check if this GIF belongs to the channel (exact match on username)
+                        if gif_username == channel_username_lower:
+                            # Found a GIF from the channel in search results!
+                            position = offset + index + 1
+                            return True
+                        
+                        # Also check display_name (some channels might use display_name)
+                        if gif_display_name == channel_username_lower:
+                            position = offset + index + 1
+                            return True
+                        
+                        # Also check if channel username is contained in GIF username or vice versa
+                        # (handles variations like "opendroids" vs "opendroids_" or similar)
+                        if gif_username and channel_username_lower:
+                            # Check if one contains the other (fuzzy match for variations)
+                            # But be careful - only match if it's a close match (not just substring)
+                            if (channel_username_lower in gif_username or 
+                                gif_username in channel_username_lower):
+                                # Additional check: ensure it's not just a partial word match
+                                # e.g., "robot" should NOT match "robotics" but "opendroids" should match "opendroids_"
+                                diff = abs(len(gif_username) - len(channel_username_lower))
+                                if diff <= 2:  # Allow small differences (underscores, case, etc.)
+                                    position = offset + index + 1
+                                    return True
+                
+                # Get total count from pagination if available (matches JavaScript)
+                total_results = total_count if total_count > 0 else (offset + len(search_results))
+                
+                # Continue searching even if this batch has fewer than limit results
+                # Only break if we've reached the actual end of results
+                if len(search_results) < limit:
+                    # Check if we've reached the end based on pagination (matches JavaScript logic)
+                    if total_count > 0 and offset + len(search_results) >= total_count:
+                        # Reached end of results
+                        break
+                
+                # If this batch has fewer than 100 results but we haven't reached maxOffset, continue
+                if len(search_results) < limit and offset < max_offset:
+                    # Still increment by limit to search deeper (matches JavaScript)
+                    offset += limit
+                    continue
+                
+                # Move to next page
+                offset += limit
+                
+                # Small delay between pages to avoid rate limiting (matches JavaScript sleep)
+                if offset <= max_offset:
+                    time.sleep(REQUEST_DELAY_MIN)
+            else:
+                # If request fails, stop searching
+                break
+        
+        # If we reach here, no GIFs from the channel were found in search results
+        # Debug: Log that we searched but didn't find channel GIFs
+        return False
+        
+    except Exception as e:
+        print(f"  Error checking search results for channel '{channel_username}' with query '{search_query}': {str(e)}")
+        return False
+
+
+def check_gif_in_search_results(gif_id: str, search_query: str, max_results: int = 2500, channel_username: str = None) -> bool:
+    """
+    Check if a GIF appears in search results for a given query.
+    Matches JavaScript logic: searches up to 2500 results using limit=100.
+    Only checks 'relevant' sort type (default).
+    
+    Args:
+        gif_id: The GIF ID to search for
+        search_query: The search query/tag to use
+        max_results: Maximum number of results to check (default 2500, checks multiple pages)
+        channel_username: Optional channel username for logging/debugging (not required for match)
+        
+    Returns:
+        True if GIF is found in search results (GIF ID match), False otherwise
+    """
+    try:
+        search_url = f"{GIPHY_API_BASE}/gifs/search"
+        limit = 100  # API limit per request (matches JavaScript)
+        offset = 0
+        max_offset = 2400  # Search up to 2500 results (2400 + 100) - matches JavaScript logic
+        
+        # Normalize GIF ID to string for comparison
+        gif_id_str = str(gif_id).strip()
+        
+        # Normalize channel username for comparison
+        channel_username_lower = channel_username.lower() if channel_username else None
+        
+        while offset <= max_offset:
+            # Build search params - only 'relevant' sort (default, no sort parameter)
+            search_params = {
+                'api_key': GIPHY_API_KEY,
+                'q': search_query,
+                'limit': limit,
+                'offset': offset
+                # No sort parameter = 'relevant' (default)
+            }
+            
+            response = _requests_session.get(search_url, params=search_params, timeout=REQUEST_TIMEOUT)
+            
+            if response.status_code == 200:
+                response_data = response.json()
+                search_results = response_data.get('data', [])
+                pagination = response_data.get('pagination', {})
+                total_count = pagination.get('total_count', 0)
+                
+                if not search_results:
+                    # No data returned, but continue searching if we haven't reached maxOffset
+                    if offset < max_offset:
+                        offset += limit
+                        continue
+                    else:
+                        break
+                
+                # Check if our GIF is in the results
+                # Match JavaScript logic: findIndex equivalent
+                # JavaScript uses: const position = response.data.data.findIndex(gif => gif.id === gifId);
+                for index, gif in enumerate(search_results):
+                    result_gif_id = gif.get('id')
+                    
+                    # Direct comparison (matches JavaScript: gif.id === gifId)
+                    # JavaScript does strict equality (===), so we should compare directly first
+                    if result_gif_id == gif_id:
+                        # Found matching GIF ID - exact match (matches JavaScript ===)
+                        position = offset + index + 1
+                        return True
+                    
+                    # Fallback: Normalize to string for comparison (handles type mismatches)
+                    result_gif_id_str = str(result_gif_id).strip() if result_gif_id else None
+                    gif_id_str_normalized = str(gif_id).strip()
+                    
+                    if result_gif_id_str == gif_id_str_normalized:
+                        # Found matching GIF ID - string comparison match
+                        position = offset + index + 1
+                        return True
+                
+                # Get total count from pagination if available (matches JavaScript)
+                total_results = total_count if total_count > 0 else (offset + len(search_results))
+                
+                # Continue searching even if this batch has fewer than limit results
+                # Only break if we've reached the actual end of results
+                if len(search_results) < limit:
+                    # Check if we've reached the end based on pagination (matches JavaScript logic)
+                    if total_count > 0 and offset + len(search_results) >= total_count:
+                        # Reached end of results
+                        break
+                
+                # If this batch has fewer than 100 results but we haven't reached maxOffset, continue
+                if len(search_results) < limit and offset < max_offset:
+                    # Still increment by limit to search deeper (matches JavaScript)
+                    offset += limit
+                    continue
+                
+                # Move to next page
+                offset += limit
+                
+                # Small delay between pages to avoid rate limiting (matches JavaScript sleep)
+                if offset <= max_offset:
+                    time.sleep(REQUEST_DELAY_MIN)
+            else:
+                # If request fails, stop searching
+                break
+        
+        # If we reach here, GIF was not found in search results
+        # Matches JavaScript: "GIF not found in top X results"
+        # Debug: Log that we searched but didn't find it
+        # This helps identify if search is working but GIF isn't in results
+        return False
+        
+    except Exception as e:
+        print(f"  Error checking search results for GIF {gif_id} with query '{search_query}': {str(e)}")
+        return False
+
+
+def _check_single_gif_visibility(gif_data: tuple, tags_dict: dict = None, channel_username: str = None) -> dict:
+    """
+    Helper function to check if a GIF's tags result in channel visibility.
+    Optimized for speed with pre-fetched tags.
+    
+    NEW LOGIC: For each tag, checks if ANY GIF from the channel appears in search results.
+    If any GIF from the channel is found in search for a tag, the GIF counts as visible.
+    This is more reliable than checking specific GIFs.
+    
+    Args:
+        gif_data: Tuple of (index, total, gif_dict)
+        tags_dict: Optional pre-fetched tags dictionary (gif_id -> tags list)
+        channel_username: Channel username - if provided, checks if ANY GIF from channel appears in search
+        
+    Returns:
+        Dictionary with GIF check results
+    """
+    i, total, gif = gif_data
+    gif_id = gif.get('id')
+    gif_title = gif.get('title', '')
+    
+    print(f"\n  [{i}/{total}] Checking GIF: {gif_id}")
+    
+    # Get tags - use pre-fetched if available, otherwise fetch now
+    if tags_dict and gif_id in tags_dict:
+        tags = tags_dict[gif_id]
+    else:
+        tags = get_gif_tags(gif_id)
+    
+    if not tags:
+        # If no tags, try using the title as search query
+        if gif_title:
+            tags = [word for word in gif_title.split() if len(word) > 3]
+        else:
+            tags = []
+    
+    if not tags:
+        print(f"    [WARN] No tags or title available, skipping")
+        return {
+            'gif_id': gif_id,
+            'found': False,
+            'reason': 'No tags available',
+            'checked_tags': []
+        }
+    
+    print(f"    Found {len(tags)} tag(s): {', '.join(tags[:10])}{'...' if len(tags) > 10 else ''}")
+    
+    # Check if GIF appears in search results for tags
+    # Check more tags (up to 10) and search deeper (2500 results) to properly detect visibility
+    # Only check 'relevant' sort type (not 'newest')
+    tags_to_check = tags[:10]  # Check more tags for better accuracy
+    checked_tags = []
+    found_in_any_tag = False
+    
+    def check_tag(tag):
+        """Check a single tag - if ANY GIF from the channel is found in search, it counts as found"""
+        # NEW LOGIC: Check if ANY GIF from the channel appears in search results for this tag
+        # This is more reliable - if any GIF from the channel is visible, the channel is working
+        
+        if channel_username:
+            # Check if any GIF from the channel appears in search results for this tag
+            # This searches up to 2500 results and checks if any GIF belongs to the channel
+            found = check_channel_gifs_in_search_results(tag, channel_username, max_results=2500)
+            
+            if found:
+                print(f"    [OK] Channel GIF found in search for tag: '{tag}' (relevant sort)")
+            else:
+                # Debug: The channel GIFs might be there but we're not matching correctly
+                # This could happen if:
+                # 1. Channel username format is different in search results
+                # 2. Search is not returning channel GIFs (shadow banned)
+                # 3. Channel GIFs are beyond 2500 results
+                print(f"    [X] No channel GIFs found in search for tag: '{tag}' (relevant sort)")
+        else:
+            # Fallback: Check if the specific GIF appears (if no channel username provided)
+            found = check_gif_in_search_results(gif_id, tag, max_results=2500, channel_username=channel_username)
+            
+            if found:
+                print(f"    [OK] Found in search for tag: '{tag}' (relevant sort)")
+            else:
+                print(f"    [X] Not found in search for tag: '{tag}' (relevant sort)")
+        
+        return {
+            'tag': tag, 
+            'found': found,
+            'found_relevant': found,
+            'found_newest': False  # Not checking newest
+        }
+    
+    # Check tags in parallel (up to 3 at a time) for faster execution
+    # Stop early if we find a match
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        tag_futures = {executor.submit(check_tag, tag): tag for tag in tags_to_check}
+        
+        for future in as_completed(tag_futures):
+            if found_in_any_tag:
+                # Cancel remaining futures if we already found a match
+                for remaining_future in tag_futures:
+                    if not remaining_future.done():
+                        remaining_future.cancel()
+                break
+            
+            tag = tag_futures[future]
+            try:
+                tag_result = future.result()
+                checked_tags.append(tag_result)
+                
+                if tag_result['found']:
+                    found_in_any_tag = True
+                    # Cancel remaining futures
+                    for remaining_future in tag_futures:
+                        if not remaining_future.done():
+                            remaining_future.cancel()
+                    break
+            except CancelledError:
+                checked_tags.append({
+                    'tag': tag,
+                    'found': False,
+                    'found_relevant': False,
+                    'found_newest': False,
+                    'skipped': True
+                })
+            except Exception as e:
+                print(f"    [ERROR] Error checking tag '{tag}': {str(e)}")
+                checked_tags.append({
+                    'tag': tag,
+                    'found': False,
+                    'found_relevant': False,
+                    'found_newest': False,
+                    'error': str(e)
+                })
+    
+    # Sort checked_tags by original order
+    tag_order = {tag: i for i, tag in enumerate(tags_to_check)}
+    checked_tags.sort(key=lambda x: tag_order.get(x.get('tag', ''), 999))
+    
+    return {
+        'gif_id': gif_id,
+        'found': found_in_any_tag,
+        'checked_tags': checked_tags
+    }
+
+
+def check_shadow_banned_channel(channel_username: str, channel_gifs: list = None) -> dict:
+    """
+    Check if a channel is shadow banned.
+    Optimized with parallel processing for faster execution.
+    
+    Logic: 
+    - Fetch first 15 GIFs from the channel
+    - Get tags for each GIF
+    - For each tag, check if ANY GIF from the channel appears in search results
+    - If channel GIFs are not found in search results, channel is shadow banned
+    - NEW: If ANY GIF from the channel is found in search for a tag, that GIF counts as visible
+    
+    Args:
+        channel_username: The channel username to check
+        channel_gifs: Optional list of GIFs (if already fetched)
+        
+    Returns:
+        Dictionary with shadow banned status and details
+        {
+            'is_shadow_banned': bool,
+            'gifs_checked': int,
+            'gifs_found_in_search': int,
+            'gifs_not_found': int,
+            'details': list of dict with results for each GIF
+        }
+    """
+    result = {
+        'is_shadow_banned': False,
+        'gifs_checked': 0,
+        'gifs_found_in_search': 0,
+        'gifs_not_found': 0,
+        'details': []
+    }
+    
+    print(f"\n{'='*60}")
+    print(f"Checking SHADOW BANNED status for: {channel_username}")
+    print(f"{'='*60}")
+    
+    # Fetch GIFs if not provided
+    if channel_gifs is None:
+        channel_info = fetch_channel_info(channel_username)
+        if not channel_info.get('exists'):
+            result['is_shadow_banned'] = True
+            result['reason'] = 'Channel not found'
+            return result
+        channel_gifs = channel_info.get('gifs_list', [])
+    
+    # Take first 15 GIFs
+    sample_gifs = channel_gifs[:15]
+    result['gifs_checked'] = len(sample_gifs)
+    
+    if len(sample_gifs) == 0:
+        result['is_shadow_banned'] = True
+        result['reason'] = 'No GIFs to check'
+        print(f"[X] SHADOW BANNED: No GIFs available to check")
+        return result
+    
+    print(f"Checking {len(sample_gifs)} GIFs for search visibility...")
+    
+    # Step 1: Fetch all tags in parallel for speed
+    print(f"  Fetching tags for {len(sample_gifs)} GIFs in parallel...")
+    gif_ids = [gif.get('id') for gif in sample_gifs if gif.get('id')]
+    tags_dict = get_gif_tags_batch(gif_ids, channel_username)
+    print(f"  ✓ Fetched tags for {len(tags_dict)} GIFs")
+    
+    # Step 2: Process GIFs in parallel (up to 8 at a time) with pre-fetched tags - optimized
+    gif_data_list = [(i+1, len(sample_gifs), gif) for i, gif in enumerate(sample_gifs)]
+    gif_results_dict = {}  # Store results by index to maintain order
+    
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        gif_futures = {executor.submit(_check_single_gif_visibility, gif_data, tags_dict, channel_username): gif_data 
+                      for gif_data in gif_data_list}
+        
+        for future in as_completed(gif_futures):
+            try:
+                gif_result = future.result()
+                gif_data = gif_futures[future]
+                index = gif_data[0] - 1  # Convert to 0-based index
+                gif_results_dict[index] = gif_result
+                
+                if gif_result.get('found'):
+                    result['gifs_found_in_search'] += 1
+                else:
+                    result['gifs_not_found'] += 1
+            except Exception as e:
+                # Handle exceptions from individual GIF checks
+                gif_data = gif_futures.get(future, (0, 0, {}))
+                index = gif_data[0] - 1 if len(gif_data) > 0 else 0
+                gif_id = gif_data[2].get('id', 'unknown') if len(gif_data) > 2 else 'unknown'
+                print(f"    [ERROR] Failed to check GIF {gif_id}: {str(e)}")
+                gif_results_dict[index] = {
+                    'gif_id': gif_id,
+                    'found': False,
+                    'reason': f'Error: {str(e)}',
+                    'checked_tags': []
+                }
+                result['gifs_not_found'] += 1
+    
+    # Sort results by index to maintain original order
+    result['details'] = [gif_results_dict[i] for i in sorted(gif_results_dict.keys())]
+    
+    # Determine if shadow banned
+    # If less than 30% of GIFs are found in search, consider it shadow banned
+    visibility_rate = (result['gifs_found_in_search'] / result['gifs_checked'] * 100) if result['gifs_checked'] > 0 else 0
+    
+    if visibility_rate < 30:
+        result['is_shadow_banned'] = True
+        result['reason'] = f'Only {visibility_rate:.1f}% of GIFs visible in search'
+        print(f"\n[X] SHADOW BANNED: Only {result['gifs_found_in_search']}/{result['gifs_checked']} GIFs found in search ({visibility_rate:.1f}%)")
+    else:
+        result['is_shadow_banned'] = False
+        result['reason'] = f'{visibility_rate:.1f}% of GIFs visible in search'
+        print(f"\n[OK] NOT SHADOW BANNED: {result['gifs_found_in_search']}/{result['gifs_checked']} GIFs found in search ({visibility_rate:.1f}%)")
+    
+    return result
+
+
+def check_working_channel(channel_username: str, channel_gifs: list = None) -> dict:
+    """
+    Check if a channel is working properly.
+    
+    Logic:
+    - Channel exists and has GIFs/views (not banned)
+    - GIFs from the channel appear in search results (not shadow banned)
+    - Count how many GIFs from the same channel URL are found in search results
+    
+    Args:
+        channel_username: The channel username to check
+        channel_gifs: Optional list of GIFs (if already fetched)
+        
+    Returns:
+        Dictionary with working status and details
+        {
+            'is_working': bool,
+            'gifs_found_in_search': int,
+            'total_gifs_checked': int,
+            'visibility_rate': float,
+            'details': dict with banned and shadow banned results
+        }
+    """
+    result = {
+        'is_working': False,
+        'gifs_found_in_search': 0,
+        'total_gifs_checked': 0,
+        'visibility_rate': 0.0,
+        'details': {}
+    }
+    
+    print(f"\n{'='*60}")
+    print(f"Checking WORKING status for: {channel_username}")
+    print(f"{'='*60}")
+    
+    # Step 1: Check if banned
+    banned_result = check_banned_channel(channel_username)
+    result['details']['banned_check'] = banned_result
+    
+    if banned_result.get('is_banned'):
+        result['is_working'] = False
+        result['reason'] = 'Channel is banned'
+        print(f"[X] NOT WORKING: Channel is banned")
+        return result
+    
+    # Step 2: Check if shadow banned (this will also verify GIFs in search)
+    if channel_gifs is None:
+        channel_info = banned_result.get('channel_info', {})
+        channel_gifs = channel_info.get('gifs_list', [])
+    
+    shadow_banned_result = check_shadow_banned_channel(channel_username, channel_gifs)
+    result['details']['shadow_banned_check'] = shadow_banned_result
+    
+    if shadow_banned_result.get('is_shadow_banned'):
+        result['is_working'] = False
+        result['reason'] = 'Channel is shadow banned'
+        print(f"[X] NOT WORKING: Channel is shadow banned")
+        return result
+    
+    # Step 3: If not banned and not shadow banned, channel is working
+    result['is_working'] = True
+    result['gifs_found_in_search'] = shadow_banned_result.get('gifs_found_in_search', 0)
+    result['total_gifs_checked'] = shadow_banned_result.get('gifs_checked', 0)
+    
+    if result['total_gifs_checked'] > 0:
+        result['visibility_rate'] = (result['gifs_found_in_search'] / result['total_gifs_checked']) * 100
+    else:
+        result['visibility_rate'] = 0.0
+    
+    result['reason'] = f'Channel is working - {result["gifs_found_in_search"]}/{result["total_gifs_checked"]} GIFs visible in search'
+    print(f"[OK] WORKING: Channel is active and {result['gifs_found_in_search']}/{result['total_gifs_checked']} GIFs are visible in search ({result['visibility_rate']:.1f}%)")
+    
+    return result
+
+
+def detect_channel_status(channel_input: str) -> dict:
+    """
+    Main function to detect channel status (banned, shadow banned, or working).
+    
+    This function orchestrates all detection methods and returns a comprehensive result.
+    Can accept either a GIPHY channel URL or a channel username.
+    
+    Args:
+        channel_input: The channel URL (e.g., https://giphy.com/channel/Brunch-us) or username (e.g., Brunch-us)
+        
+    Returns:
+        Dictionary with complete channel status analysis
+        {
+            'channel_username': str,
+            'status': 'banned' | 'shadow_banned' | 'working' | 'unknown',
+            'banned_check': dict,
+            'shadow_banned_check': dict,
+            'working_check': dict,
+            'summary': dict with key metrics
+        }
+    """
+    # Extract username from URL if it's a URL
+    channel_username = extract_channel_username_from_url(channel_input)
+    
+    if not channel_username:
+        return {
+            'channel_username': None,
+            'status': 'error',
+            'error': f'Could not extract channel username from: {channel_input}',
+            'summary': {
+                'status': 'ERROR',
+                'reason': f'Invalid input: {channel_input}'
+            }
+        }
+    
+    print(f"\n{'='*70}")
+    print(f"CHANNEL STATUS DETECTION")
+    print(f"Input: {channel_input}")
+    print(f"Channel: {channel_username}")
+    print(f"{'='*70}\n")
+    
+    result = {
+        'channel_username': channel_username,
+        'original_input': channel_input,
+        'status': 'unknown',
+        'banned_check': None,
+        'shadow_banned_check': None,
+        'working_check': None,
+        'summary': {}
+    }
+    
+    try:
+        # Step 1: Check if banned
+        banned_result = check_banned_channel(channel_username)
+        result['banned_check'] = banned_result
+        
+        if banned_result.get('is_banned'):
+            result['status'] = 'banned'
+            # For banned channels, ensure total_gifs and total_views are always 0
+            # (API cannot fetch these values for banned channels)
+            channel_info = banned_result.get('channel_info', {})
+            result['summary'] = {
+                'status': 'BANNED',
+                'reason': banned_result.get('reason', 'Channel not found'),
+                'total_gifs': 0,  # Banned channels never show total GIFs
+                'total_views': 0  # Banned channels never show total views
+            }
+            # Ensure channel_info also has 0 values
+            if channel_info:
+                channel_info['total_gifs'] = 0
+                channel_info['total_views'] = 0
+            print(f"[BANNED] Total GIFs: 0, Total Views: 0 (not accessible from API)")
+            return result
+        
+        # Step 2: Get channel info for shadow banned check
+        # Only proceed if channel is NOT banned (has GIFs and views from API)
+        channel_info = banned_result.get('channel_info', {})
+        channel_gifs = channel_info.get('gifs_list', [])
+        total_gifs = channel_info.get('total_gifs', 0)
+        total_views = channel_info.get('total_views', 0)
+        
+        # Ensure we have valid data (not banned)
+        if total_gifs == 0 and total_views == 0:
+            # This shouldn't happen if not banned, but double-check
+            result['status'] = 'banned'
+            result['summary'] = {
+                'status': 'BANNED',
+                'reason': 'No GIFs or views accessible from API',
+                'total_gifs': 0,
+                'total_views': 0
+            }
+            return result
+        
+        # Step 3: Check if shadow banned
+        # SHADOW BANNED: Channel shows total GIFs and total views from API,
+        # but GIFs are NOT found in search results
+        shadow_banned_result = check_shadow_banned_channel(channel_username, channel_gifs)
+        result['shadow_banned_check'] = shadow_banned_result
+        
+        if shadow_banned_result.get('is_shadow_banned'):
+            result['status'] = 'shadow_banned'
+            result['summary'] = {
+                'status': 'SHADOW BANNED',
+                'reason': shadow_banned_result.get('reason', 'GIFs not visible in search'),
+                'total_gifs': total_gifs,  # Shadow banned shows total GIFs from API
+                'total_views': total_views,  # Shadow banned shows total views from API
+                'gifs_checked': shadow_banned_result.get('gifs_checked', 0),
+                'gifs_found_in_search': shadow_banned_result.get('gifs_found_in_search', 0)
+            }
+            print(f"[SHADOW BANNED] Total GIFs: {total_gifs}, Total Views: {total_views:,} (visible in API but not in search)")
+            return result
+        
+        # Step 4: Check if working (not banned and not shadow banned)
+        working_result = check_working_channel(channel_username, channel_gifs)
+        result['working_check'] = working_result
+        
+        if working_result.get('is_working'):
+            result['status'] = 'working'
+            result['summary'] = {
+                'status': 'WORKING',
+                'reason': working_result.get('reason', 'Channel is active'),
+                'total_gifs': total_gifs,  # Working shows total GIFs from API
+                'total_views': total_views,  # Working shows total views from API
+                'gifs_checked': working_result.get('total_gifs_checked', 0),
+                'gifs_found_in_search': working_result.get('gifs_found_in_search', 0),
+                'visibility_rate': working_result.get('visibility_rate', 0.0)
+            }
+            print(f"[WORKING] Total GIFs: {total_gifs}, Total Views: {total_views:,} (visible in API and in search)")
+        else:
+            result['status'] = 'unknown'
+            result['summary'] = {
+                'status': 'UNKNOWN',
+                'reason': 'Could not determine status',
+                'total_gifs': total_gifs,
+                'total_views': total_views
+            }
+        
+    except Exception as e:
+        import traceback
+        error_msg = str(e) if str(e) else type(e).__name__
+        error_trace = traceback.format_exc()
+        result['status'] = 'error'
+        result['error'] = error_msg
+        result['summary'] = {
+            'status': 'ERROR',
+            'reason': f'Error during detection: {error_msg}'
+        }
+        print(f"[X] Error during detection: {error_msg}")
+        print(f"[X] Traceback: {error_trace}")
+    
+    # Print final summary
+    print(f"\n{'='*70}")
+    print(f"FINAL STATUS: {result['summary'].get('status', 'UNKNOWN')}")
+    print(f"{'='*70}")
+    print(f"Channel: {channel_username}")
+    print(f"Status: {result['status']}")
+    if result['summary'].get('total_gifs') is not None:
+        print(f"Total GIFs: {result['summary'].get('total_gifs', 0)}")
+    if result['summary'].get('total_views') is not None:
+        print(f"Total Views: {result['summary'].get('total_views', 0)}")
+    if result['summary'].get('visibility_rate') is not None:
+        print(f"Visibility Rate: {result['summary'].get('visibility_rate', 0):.1f}%")
+    print(f"Reason: {result['summary'].get('reason', 'N/A')}")
+    print(f"{'='*70}\n")
+    
+    return result
+
+
+def extract_channel_username_from_url(url: str):
+    """
+    Extract channel username or ID from Giphy URL.
+    
+    Supports multiple URL formats:
+    - https://giphy.com/channel/username
+    - https://giphy.com/@username
+    - https://giphy.com/username
+    - Just "username" (returns as-is)
+    
+    Args:
+        url: The GIPHY channel URL or username
+        
+    Returns:
+        Extracted username/ID or None if extraction fails
+    """
+    if not url or not url.strip():
+        return None
+    
+    url_original = url.strip()
+    
+    # If it doesn't look like a URL (no http/https or giphy.com), return as-is (assume it's already a username)
+    if not ('http' in url_original.lower() or 'giphy.com' in url_original.lower()):
+        return url_original
+    
+    # Clean the URL - remove protocol, www, trailing slashes
+    url_clean = url_original.lower().strip()
+    url_clean = re.sub(r'^https?://(www\.)?', '', url_clean)
+    url_clean = url_clean.rstrip('/')
+    
+    # Keep original for extraction to preserve case
+    url = url_original.strip()
+    url = re.sub(r'^https?://(www\.)?', '', url)
+    url = url.rstrip('/')
+    
+    # Check if it's a GIF URL format: giphy.com/gifs/username-...-gifid
+    gif_url_match = re.search(r'giphy\.com/gifs/([^/]+)', url_clean, re.IGNORECASE)
+    if gif_url_match:
+        # Extract the username from GIF URL (format: username-title-words-gifid)
+        gif_path = gif_url_match.group(1)
+        parts = gif_path.split('-')
+        if len(parts) > 1:
+            potential_username = parts[0]
+            skip_words = ['gifs', 'gif', 'stickers', 'clips']
+            if potential_username.lower() not in skip_words:
+                # Extract from original URL to preserve case
+                orig_match = re.search(r'giphy\.com/gifs/([^/]+)', url, re.IGNORECASE)
+                if orig_match:
+                    orig_parts = orig_match.group(1).split('-')
+                    if len(orig_parts) > 1:
+                        return orig_parts[0]
+                return potential_username
+    
+    # Patterns for channel URLs
+    patterns = [
+        r'giphy\.com/channel/([^/?]+)',  # /channel/username (e.g., https://giphy.com/channel/Brunch-us)
+        r'giphy\.com/@([^/?]+)',          # /@username (e.g., https://giphy.com/@Brunch-us)
+        r'giphy\.com/([^/?]+)/channel',   # /username/channel (reverse format)
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url, re.IGNORECASE)
+        if match:
+            identifier = match.group(1)
+            # Handle URLs with trailing paths like /stickers
+            identifier = identifier.split('/')[0]
+            # Preserve trailing underscore - it might be part of the actual username
+            # (e.g., GifStudios_ has underscore as part of username)
+            return identifier
+    
+    # Try direct format: giphy.com/username
+    # This should be the last pattern to avoid matching other paths
+    direct_match = re.search(r'giphy\.com/([^/?]+)$', url, re.IGNORECASE)
+    if direct_match:
+        identifier = direct_match.group(1)
+        # Skip common paths that aren't usernames
+        skip_paths = ['explore', 'search', 'trending', 'reactions', 'artists', 'stickers', 'clips', 'upload', 'gifs']
+        if identifier.lower() not in skip_paths:
+            # Preserve trailing underscore - it might be part of the actual username
+            # (e.g., GifStudios_ has underscore as part of username)
+            return identifier
+    
+    return None
+
+# ============================================================================
+# End of Channel Status Detector Functions
+# ============================================================================
 
 def extract_views_from_nested_dict(data, max_depth=10):
     """
@@ -160,7 +1641,7 @@ def extract_views_from_nested_dict(data, max_depth=10):
 def get_gif_url_from_db(gif_id):
     """Get stored GIF URL from database"""
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT url FROM gifs WHERE gif_id = ?', (gif_id,))
         result = cursor.fetchone()
@@ -187,7 +1668,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
             try:
                 gif_detail_url = f"{GIPHY_API_BASE}/gifs/{gif_id}"
                 gif_detail_params = {'api_key': GIPHY_API_KEY}
-                gif_detail_response = requests.get(gif_detail_url, params=gif_detail_params, timeout=5)
+                gif_detail_response = _requests_session.get(gif_detail_url, params=gif_detail_params, timeout=5)
                 
                 if gif_detail_response.status_code == 200:
                     gif_detail = gif_detail_response.json().get('data', {})
@@ -246,7 +1727,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
         # Try each URL until one works
         for test_url in url_to_try:
             try:
-                response = requests.get(test_url, headers=headers, proxies=proxies, timeout=15, allow_redirects=True)
+                response = _requests_session.get(test_url, headers=headers, proxies=proxies, timeout=15, allow_redirects=True)
             except Exception as e:
                 print(f"  [{location}] Request error for {test_url}: {str(e)[:50]}")
                 continue  # Try next URL
@@ -842,7 +2323,7 @@ def scrape_gif_views(gif_id):
 
 def store_channel_data(channel_id, username=None, user_id=None, display_name=None, profile_url=None):
     """Store or update channel data in database"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -855,7 +2336,7 @@ def store_channel_data(channel_id, username=None, user_id=None, display_name=Non
 
 def store_gif_data(gif_id, channel_id, title=None, url=None):
     """Store or update GIF data in database"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -871,7 +2352,7 @@ def store_view_count(gif_id, view_count, recorded_date=None):
     if recorded_date is None:
         recorded_date = datetime.now().date()
     
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -884,7 +2365,7 @@ def store_view_count(gif_id, view_count, recorded_date=None):
 
 def get_gif_view_history(gif_id, days=7):
     """Get view history for a GIF over the specified number of days"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     start_date = (datetime.now() - timedelta(days=days)).date()
@@ -903,7 +2384,7 @@ def get_gif_view_history(gif_id, days=7):
 
 def get_channel_gifs(channel_id):
     """Get all GIFs for a channel"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -919,7 +2400,7 @@ def get_channel_gifs(channel_id):
 
 def get_latest_views_for_channel(channel_id):
     """Get latest view counts for all GIFs in a channel"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -943,7 +2424,7 @@ def get_channel_total_views_for_date(channel_id, target_date):
     Get total view count for all GIFs in a channel for a specific date.
     Returns the sum of all views for that date.
     """
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # Get all GIF IDs for this channel
@@ -987,7 +2468,7 @@ def get_channel_views_history_graph(channel_id, days=30):
         - total_views: List of cumulative total views for each date
         - data_points: List of {date, views} objects for easy graphing
     """
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # Get all GIF IDs for this channel
@@ -1044,7 +2525,7 @@ def get_channel_total_views_24_hours_ago(channel_id):
     This allows comparison at any time, not just at midnight.
     Returns the sum of all views from approximately 24 hours ago.
     """
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # Get all GIF IDs for this channel
@@ -1087,7 +2568,7 @@ def get_channel_total_views_48_hours_ago(channel_id):
     This allows comparison over a longer period for better trend detection.
     Returns the sum of all views from approximately 48 hours ago.
     """
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # Get all GIF IDs for this channel
@@ -1153,7 +2634,7 @@ def fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=True):
             # Fetch from API (REAL-TIME)
             gif_detail_url = f"{GIPHY_API_BASE}/gifs/{gif_id}"
             gif_detail_params = {'api_key': GIPHY_API_KEY}
-            gif_detail_response = requests.get(gif_detail_url, params=gif_detail_params, timeout=5)
+            gif_detail_response = _requests_session.get(gif_detail_url, params=gif_detail_params, timeout=5)
             
             if gif_detail_response.status_code == 200:
                 gif_detail = gif_detail_response.json().get('data', {})
@@ -1433,10 +2914,11 @@ def analyze_view_trends(gif_ids, days=7, channel_id=None, use_24_hour_comparison
         'previous_48h_timestamp': previous_48h_timestamp
     }
 
-def update_gif_views_batch(gif_ids, max_workers=5):
+def update_gif_views_batch(gif_ids, max_workers=10):
     """
     Update view counts for a batch of GIFs by scraping Giphy pages.
-    Uses threading to speed up the process.
+    Uses ThreadPoolExecutor for better performance and resource management.
+    Optimized for faster execution.
     """
     results = []
     
@@ -1451,29 +2933,17 @@ def update_gif_views_batch(gif_ids, max_workers=5):
         except Exception as e:
             return {'gif_id': gif_id, 'error': str(e), 'success': False}
     
-    # Process in batches to avoid overwhelming the server
-    for i in range(0, len(gif_ids), max_workers):
-        batch = gif_ids[i:i + max_workers]
-        threads = []
-        batch_results = []
+    # Use ThreadPoolExecutor for better performance
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(update_single_gif, gif_id): gif_id for gif_id in gif_ids}
         
-        def worker(gif_id, result_list):
-            result = update_single_gif(gif_id)
-            result_list.append(result)
-        
-        for gif_id in batch:
-            t = threading.Thread(target=worker, args=(gif_id, batch_results))
-            t.start()
-            threads.append(t)
-        
-        for t in threads:
-            t.join()
-        
-        results.extend(batch_results)
-        
-        # Small delay between batches to be respectful
-        if i + max_workers < len(gif_ids):
-            time.sleep(1)
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                gif_id = futures[future]
+                results.append({'gif_id': gif_id, 'error': str(e), 'success': False})
     
     return results
 
@@ -1533,8 +3003,9 @@ def extract_channel_info_from_url(url):
             identifier = match.group(1)
             # Handle URLs with trailing paths like /stickers
             identifier = identifier.split('/')[0]
-            # Remove trailing underscore if present
-            return identifier.rstrip('_')
+            # Preserve trailing underscore - it might be part of the actual username
+            # (e.g., GifStudios_ has underscore as part of username)
+            return identifier
     
     # Try direct format: giphy.com/username
     # This should be the last pattern to avoid matching other paths
@@ -1544,8 +3015,9 @@ def extract_channel_info_from_url(url):
         # Skip common paths that aren't usernames
         skip_paths = ['explore', 'search', 'trending', 'reactions', 'artists', 'stickers', 'clips', 'upload', 'gifs']
         if identifier.lower() not in skip_paths:
-            # Remove trailing underscore if present
-            return identifier.rstrip('_')
+            # Preserve trailing underscore - it might be part of the actual username
+            # (e.g., GifStudios_ has underscore as part of username)
+            return identifier
     
     return None
 
@@ -1578,7 +3050,7 @@ def check_channel_via_web_scraping(channel_identifier, original_url):
         
         for url in url_formats:
             try:
-                response = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+                response = _requests_session.get(url, headers=headers, timeout=10, allow_redirects=True)
                 
                 if response.status_code == 200:
                     html_content = response.text
@@ -1586,31 +3058,304 @@ def check_channel_via_web_scraping(channel_identifier, original_url):
                     # Check if page contains channel/user information
                     # Look for JSON-LD or meta tags with user info
                     if 'giphy.com' in response.url and ('channel' in response.url or f'/{channel_identifier}' in response.url):
-                        # Try to extract user data from page
-                        # Giphy often embeds user data in script tags
-                        script_pattern = r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>'
-                        scripts = re.findall(script_pattern, html_content, re.DOTALL)
+                        page_accessible = True
+                        upload_count = None
+                        views_count = None
+                        user_data_from_page = None
+                        all_gifs_from_page = []  # Initialize GIFs list
                         
-                        for script in scripts:
+                        # Extract upload count and views count from the page
+                        soup = BeautifulSoup(html_content, 'html.parser')
+                        
+                        # Method 1: Look for __NEXT_DATA__ script tag (Giphy uses Next.js)
+                        next_data_script = soup.find('script', id='__NEXT_DATA__')
+                        if next_data_script and next_data_script.string:
                             try:
-                                data = json.loads(script)
-                                if isinstance(data, dict) and 'user' in data:
-                                    user_data = data['user']
-                                    results['exists'] = True
-                                    results['details'] = {
-                                        'username': user_data.get('username', channel_identifier),
-                                        'display_name': user_data.get('display_name', ''),
-                                        'user_id': user_data.get('id', ''),
-                                        'profile_url': response.url,
-                                    }
-                                    results['working'] = True
-                                    results['status'] = 'working'
-                                    return results
-                            except:
-                                continue
+                                next_data = json.loads(next_data_script.string)
+                                
+                                # Navigate through nested structure to find user data
+                                def find_in_nested(obj, target_keys, path=""):
+                                    if isinstance(obj, dict):
+                                        for key, value in obj.items():
+                                            if key in target_keys:
+                                                return value
+                                            result = find_in_nested(value, target_keys, f"{path}.{key}")
+                                            if result is not None:
+                                                return result
+                                    elif isinstance(obj, list):
+                                        for item in obj:
+                                            result = find_in_nested(item, target_keys, path)
+                                            if result is not None:
+                                                return result
+                                    return None
+                                
+                                # Look for user data
+                                user_data_from_page = find_in_nested(next_data, ['user', 'pageProps'])
+                                if user_data_from_page and isinstance(user_data_from_page, dict):
+                                    if 'user' in user_data_from_page:
+                                        user_data_from_page = user_data_from_page['user']
+                                
+                                # Extract upload count
+                                if user_data_from_page and isinstance(user_data_from_page, dict):
+                                    upload_count = (user_data_from_page.get('total_gifs') or 
+                                                   user_data_from_page.get('gif_count') or 
+                                                   user_data_from_page.get('uploads') or
+                                                   user_data_from_page.get('total_uploads'))
+                                    views_count = (user_data_from_page.get('total_views') or 
+                                                 user_data_from_page.get('views') or
+                                                 user_data_from_page.get('gif_views'))
+                                
+                                # Also check pagination for total_count
+                                pagination = find_in_nested(next_data, ['pagination'])
+                                if pagination and isinstance(pagination, dict) and upload_count is None:
+                                    upload_count = pagination.get('total_count')
+                                
+                                # Extract GIFs data from __NEXT_DATA__ if available
+                                # Look for GIFs in various possible locations in the JSON structure
+                                gifs_from_page = find_in_nested(next_data, ['gifs', 'data', 'items', 'results'])
+                                all_gifs_from_page = []
+                                
+                                if gifs_from_page:
+                                    if isinstance(gifs_from_page, list):
+                                        all_gifs_from_page = gifs_from_page
+                                    elif isinstance(gifs_from_page, dict):
+                                        if 'data' in gifs_from_page and isinstance(gifs_from_page['data'], list):
+                                            all_gifs_from_page = gifs_from_page['data']
+                                        elif 'gifs' in gifs_from_page and isinstance(gifs_from_page['gifs'], list):
+                                            all_gifs_from_page = gifs_from_page['gifs']
+                                
+                                # Also try looking in pageProps directly
+                                page_props = find_in_nested(next_data, ['pageProps'])
+                                if page_props and isinstance(page_props, dict) and not all_gifs_from_page:
+                                    if 'gifs' in page_props:
+                                        if isinstance(page_props['gifs'], list):
+                                            all_gifs_from_page = page_props['gifs']
+                                        elif isinstance(page_props['gifs'], dict) and 'data' in page_props['gifs']:
+                                            all_gifs_from_page = page_props['gifs']['data']
+                                    elif 'data' in page_props and isinstance(page_props['data'], list):
+                                        all_gifs_from_page = page_props['data']
+                                
+                                if all_gifs_from_page and len(all_gifs_from_page) > 0:
+                                    print(f"  ✓ Extracted {len(all_gifs_from_page)} GIFs from page data")
+                                    
+                            except Exception as e:
+                                # Debug: log the error for troubleshooting
+                                # print(f"  Debug: __NEXT_DATA__ extraction error: {str(e)[:100]}")
+                                pass
                         
-                        # Check for error pages or banned indicators
-                        if '404' in html_content.lower() or 'not found' in html_content.lower():
+                        # Method 2: Extract from visible text on page (e.g., "13 Uploads", "13.9K GIF Views")
+                        # Also try getting text content from BeautifulSoup to avoid HTML tags interfering
+                        page_text = soup.get_text() if soup else html_content
+                        
+                        if upload_count is None:
+                            # Look for patterns like "13 Uploads" or "13 uploads"
+                            # Try both HTML content and text content
+                            for content_source in [html_content, page_text]:
+                                upload_patterns = [
+                                    r'(\d+)\s+[Uu]ploads?',                    # "13 Uploads" or "13 uploads"
+                                    r'(\d+)\s+[Gg]IFs?',                      # "13 GIFs" or "13 gifs"
+                                    r'<[^>]*>(\d+)<[^>]*>\s*[Uu]ploads?',    # HTML tags around number: <span>13</span> Uploads
+                                    r'<[^>]*>(\d+)<[^>]*>\s*[Gg]IFs?',       # HTML tags around number: <span>13</span> GIFs
+                                    r'(\d+)\s*\n\s*[Uu]ploads?',             # Number on one line, "Uploads" on next (multiline)
+                                    r'(\d+)\s*\n\s*[Gg]IFs?',                # Number on one line, "GIFs" on next (multiline)
+                                    r'[Uu]ploads?[:\s]+(\d+)',                # "Uploads: 13"
+                                    r'[Gg]IFs?[:\s]+(\d+)',                   # "GIFs: 13"
+                                    r'"totalGifs"\s*:\s*(\d+)',              # JSON format
+                                    r'"gifCount"\s*:\s*(\d+)',               # JSON format
+                                    r'"uploads"\s*:\s*(\d+)',                # JSON format
+                                    r'"total_uploads"\s*:\s*(\d+)',          # JSON format
+                                    r'"upload_count"\s*:\s*(\d+)',           # JSON format
+                                ]
+                                for pattern in upload_patterns:
+                                    matches = re.findall(pattern, content_source, re.IGNORECASE | re.MULTILINE)
+                                    if matches:
+                                        try:
+                                            # Try to get the most reasonable number (usually the largest one that's not too big)
+                                            potential_counts = [int(m) for m in matches if str(m).isdigit()]
+                                            if potential_counts:
+                                                # Filter out unreasonable numbers (too large)
+                                                reasonable_counts = [c for c in potential_counts if 0 <= c <= 100000]
+                                                if reasonable_counts:
+                                                    upload_count = max(reasonable_counts)  # Take the largest reasonable number
+                                                    print(f"  ✓ Extracted upload count from pattern: {upload_count}")
+                                                    break
+                                        except:
+                                            continue
+                                if upload_count is not None:
+                                    break
+                        
+                        if views_count is None:
+                            # Look for patterns like "13.9K GIF Views" or "13,900 views"
+                            # Try both HTML content and text content
+                            for content_source in [html_content, page_text]:
+                                view_patterns = [
+                                    r'(\d+(?:\.\d+)?[KMB]?)\s+[Gg]IF\s+[Vv]iews?',     # "13.9K GIF Views"
+                                    r'<[^>]*>(\d+(?:\.\d+)?[KMB]?)<[^>]*>\s+[Gg]IF\s+[Vv]iews?',  # HTML: <span>13.9K</span> GIF Views
+                                    r'(\d+(?:,\d{3})*)\s+[Gg]IF\s+[Vv]iews?',          # "13,900 GIF Views"
+                                    r'(\d+(?:\.\d+)?[KMB]?)\s+[Vv]iews?',              # "13.9K Views"
+                                    r'<[^>]*>(\d+(?:\.\d+)?[KMB]?)<[^>]*>\s+[Vv]iews?',  # HTML: <span>13.9K</span> Views
+                                    r'(\d+(?:,\d{3})*)\s+[Vv]iews?',                   # "13,900 Views"
+                                    r'(\d+(?:\.\d+)?[KMB]?)\s*\n\s*[Gg]IF\s+[Vv]iews?',  # Number on one line, "GIF Views" on next (multiline)
+                                    r'(\d+(?:\.\d+)?[KMB]?)\s*\n\s*[Vv]iews?',         # Number on one line, "Views" on next (multiline)
+                                    r'[Vv]iews?[:\s]+(\d+(?:\.\d+)?[KMB]?)',           # "Views: 13.9K"
+                                    r'"totalViews"\s*:\s*(\d+)',                       # JSON format
+                                    r'"views"\s*:\s*(\d+)',                            # JSON format
+                                    r'"gifViews"\s*:\s*(\d+)',                         # JSON format
+                                    r'"total_views"\s*:\s*(\d+)',                      # JSON format
+                                    r'"view_count"\s*:\s*(\d+)',                       # JSON format
+                                ]
+                                for pattern in view_patterns:
+                                    matches = re.findall(pattern, content_source, re.IGNORECASE | re.MULTILINE)
+                                    if matches:
+                                        try:
+                                            # Process all matches and get the most reasonable one
+                                            for match in matches:
+                                                view_str = str(match).replace(',', '').replace(' ', '')
+                                                # Handle K, M, B suffixes
+                                                if 'K' in view_str.upper():
+                                                    candidate = int(float(view_str.upper().replace('K', '')) * 1000)
+                                                    if 100 <= candidate <= 1000000000:  # Reasonable range
+                                                        views_count = candidate
+                                                        print(f"  ✓ Extracted views count from pattern: {views_count:,}")
+                                                        break
+                                                elif 'M' in view_str.upper():
+                                                    candidate = int(float(view_str.upper().replace('M', '')) * 1000000)
+                                                    if 100 <= candidate <= 10000000000:  # Reasonable range
+                                                        views_count = candidate
+                                                        print(f"  ✓ Extracted views count from pattern: {views_count:,}")
+                                                        break
+                                                elif 'B' in view_str.upper():
+                                                    candidate = int(float(view_str.upper().replace('B', '')) * 1000000000)
+                                                    if 100 <= candidate <= 100000000000:  # Reasonable range
+                                                        views_count = candidate
+                                                        print(f"  ✓ Extracted views count from pattern: {views_count:,}")
+                                                        break
+                                                else:
+                                                    try:
+                                                        candidate = int(float(view_str))
+                                                        if 100 <= candidate <= 1000000000:  # Reasonable range
+                                                            views_count = candidate
+                                                            print(f"  ✓ Extracted views count from pattern: {views_count:,}")
+                                                            break
+                                                    except:
+                                                        continue
+                                            if views_count is not None:
+                                                break
+                                        except Exception as e:
+                                            continue
+                                if views_count is not None:
+                                    break
+                        
+                        # Method 3: Try JSON script tags as fallback
+                        if not user_data_from_page:
+                            script_pattern = r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>'
+                            scripts = re.findall(script_pattern, html_content, re.DOTALL)
+                            
+                            for script in scripts:
+                                try:
+                                    data = json.loads(script)
+                                    if isinstance(data, dict) and 'user' in data:
+                                        user_data_from_page = data['user']
+                                        if upload_count is None:
+                                            upload_count = user_data_from_page.get('total_gifs', user_data_from_page.get('gif_count', None))
+                                        if views_count is None:
+                                            views_count = user_data_from_page.get('total_views', user_data_from_page.get('views', None))
+                                        break
+                                except:
+                                    continue
+                        
+                        # Method 4: Final fallback - very simple patterns (handles cases where text is on separate lines)
+                        if upload_count is None or views_count is None:
+                            try:
+                                # Very simple pattern: number followed by "Uploads" (allowing for any whitespace/newlines)
+                                simple_upload_match = re.search(r'(\d+)\s*\n?\s*[Uu]ploads?', page_text, re.IGNORECASE | re.MULTILINE)
+                                if simple_upload_match and upload_count is None:
+                                    try:
+                                        candidate_upload = int(simple_upload_match.group(1))
+                                        if 0 <= candidate_upload <= 100000:
+                                            upload_count = candidate_upload
+                                            print(f"  ✓ Extracted upload count (final fallback): {upload_count}")
+                                    except:
+                                        pass
+                                
+                                # Very simple pattern: number with optional K/M/B followed by "GIF Views" or "Views"
+                                simple_view_match = re.search(r'(\d+(?:\.\d+)?[KMB]?)\s*\n?\s*[Gg]IF\s*[Vv]iews?', page_text, re.IGNORECASE | re.MULTILINE)
+                                if simple_view_match and views_count is None:
+                                    try:
+                                        view_str = simple_view_match.group(1).replace(',', '').replace(' ', '')
+                                        if 'K' in view_str.upper():
+                                            candidate_view = int(float(view_str.upper().replace('K', '')) * 1000)
+                                        elif 'M' in view_str.upper():
+                                            candidate_view = int(float(view_str.upper().replace('M', '')) * 1000000)
+                                        else:
+                                            candidate_view = int(float(view_str))
+                                        if 100 <= candidate_view <= 1000000000:
+                                            views_count = candidate_view
+                                            print(f"  ✓ Extracted views count (final fallback): {views_count:,}")
+                                    except:
+                                        pass
+                            except:
+                                pass
+                        
+                        # Store extracted metrics and GIFs
+                        results['exists'] = True
+                        results['details'] = {
+                            'username': channel_identifier,
+                            'profile_url': response.url,
+                            'uploads_from_page': upload_count,
+                            'views_from_page': views_count,
+                            'page_accessible': page_accessible,
+                            'all_gifs': all_gifs_from_page if 'all_gifs_from_page' in locals() else []
+                        }
+                        
+                        # If we found user data, add it
+                        if user_data_from_page and isinstance(user_data_from_page, dict):
+                            results['details'].update({
+                                'username': user_data_from_page.get('username', channel_identifier),
+                                'display_name': user_data_from_page.get('display_name', ''),
+                                'user_id': user_data_from_page.get('id', ''),
+                            })
+                        
+                        # Store metrics in results for later analysis
+                        # These will be used by analyze_channel_status to determine final status
+                        # Update if we found metrics with simple pattern above
+                        if upload_count is not None:
+                            results['uploads_from_page'] = upload_count
+                        if views_count is not None:
+                            results['views_from_page'] = views_count
+                        
+                        # Determine initial status based on metrics visibility
+                        # BANNED = Page shows 0 uploads AND 0 views (page doesn't display metrics)
+                        # If metrics are visible (even if 0), it's not banned - it's shadow banned or working
+                        if upload_count is not None and views_count is not None:
+                            if upload_count == 0 and views_count == 0:
+                                # Page shows 0 uploads and 0 views - BANNED
+                                results['banned'] = True
+                                results['status'] = 'banned'
+                                results['working'] = False
+                                results['shadow_banned'] = False
+                                print(f"  🚫 Page shows 0 uploads and 0 views - BANNED")
+                                return results
+                            else:
+                                # Page shows metrics (uploads > 0 OR views > 0) - NOT BANNED
+                                # Continue to check search visibility to determine if working or shadow banned
+                                print(f"  ✓ Page shows metrics: {upload_count} uploads, {views_count:,} views")
+                                results['banned'] = False
+                                # Don't set status yet - need to check search visibility via analyze_channel_status
+                        elif upload_count is not None or views_count is not None:
+                            # At least one metric found - page shows metrics - NOT BANNED
+                            print(f"  ✓ Page shows metrics: uploads={upload_count}, views={views_count}")
+                            results['banned'] = False
+                        else:
+                            # No metrics extracted - might be banned or extraction failed
+                            # But page is accessible (status 200), so it exists
+                            print(f"  ⚠️  Could not extract metrics from page (page exists but extraction failed)")
+                            # Don't mark as banned yet - let analyze_channel_status check search visibility
+                            # Since page is accessible, it's not banned - might be shadow banned or working
+                            results['banned'] = False
+                        
+                        # Check for error pages or banned indicators (only if we haven't already determined status)
+                        if results.get('status') != 'banned' and ('404' in html_content.lower() or 'not found' in html_content.lower()):
                             # Before marking as not_found, check if channel appears in search results
                             # If not in search, it's BANNED (not not_found)
                             try:
@@ -1645,49 +3390,44 @@ def check_channel_via_web_scraping(channel_identifier, original_url):
                             results['status'] = 'banned'
                             results['working'] = False
                         else:
-                            # Page exists - check if there's actual content
-                            # Look for more specific indicators of working channel
-                            has_gifs = 'gif' in html_content.lower() or 'sticker' in html_content.lower()
-                            has_user_data = 'username' in html_content.lower() or 'user' in html_content.lower()
-                            has_content = has_gifs or has_user_data
-                            
-                            # Check for common Giphy page elements
-                            has_giphy_content = any(indicator in html_content.lower() for indicator in [
-                                'giphy.com/channel', 'giphy.com/@', 'data-gif', 'data-sticker',
-                                'gif-container', 'sticker-container', 'user-profile'
-                            ])
-                            
-                            if has_content or has_giphy_content:
-                                results['exists'] = True
-                                results['working'] = True
-                                results['status'] = 'working'
-                                results['shadow_banned'] = False
-                                results['details'] = {
-                                    'username': channel_identifier,
-                                    'profile_url': response.url,
-                                }
-                                
-                                # Try to extract more info from the page
-                                try:
-                                    # Look for username in meta tags or JSON
-                                    username_match = re.search(r'"username"\s*:\s*"([^"]+)"', html_content)
-                                    if username_match:
-                                        results['details']['username'] = username_match.group(1)
-                                except:
-                                    pass
-                                
-                                return results
+                            # Page exists - if we already extracted metrics above, don't override them
+                            # Just ensure results are set correctly
+                            if upload_count is not None or views_count is not None:
+                                # Metrics were already extracted and stored above
+                                # Don't set status here - let analyze_channel_status determine it
+                                pass
                             else:
-                                # Page exists but no clear content - might be shadow banned
-                                results['exists'] = True
-                                results['shadow_banned'] = True
-                                results['status'] = 'shadow_banned'
-                                results['working'] = False
-                                results['details'] = {
-                                    'username': channel_identifier,
-                                    'profile_url': response.url,
-                                }
+                                # No metrics extracted - check for content indicators
+                                has_gifs = 'gif' in html_content.lower() or 'sticker' in html_content.lower()
+                                has_user_data = 'username' in html_content.lower() or 'user' in html_content.lower()
+                                has_content = has_gifs or has_user_data
+                                
+                                # Check for common Giphy page elements
+                                has_giphy_content = any(indicator in html_content.lower() for indicator in [
+                                    'giphy.com/channel', 'giphy.com/@', 'data-gif', 'data-sticker',
+                                    'gif-container', 'sticker-container', 'user-profile'
+                                ])
+                                
+                                if has_content or has_giphy_content:
+                                    results['exists'] = True
+                                    results['banned'] = False
+                                    # Don't set status yet - need to check search visibility
+                                    
+                                    # Try to extract more info from the page
+                                    try:
+                                        # Look for username in meta tags or JSON
+                                        username_match = re.search(r'"username"\s*:\s*"([^"]+)"', html_content)
+                                        if username_match:
+                                            results['details']['username'] = username_match.group(1)
+                                    except:
+                                        pass
+                                else:
+                                    # Page exists but no clear content and no metrics - might be shadow banned
+                                    results['exists'] = True
+                                    results['banned'] = False
+                                    # Don't set status yet - need to check search visibility
                         
+                        # Return results with extracted metrics (status will be determined by analyze_channel_status)
                         return results
                         
                 elif response.status_code == 403:
@@ -1819,6 +3559,217 @@ def extract_keywords_from_gifs(all_gifs_list, max_keywords=5):
     keywords_list = list(keywords_set)[:max_keywords]
     return keywords_list
 
+def check_gifs_one_by_one_with_tags(all_gifs_list, channel_id, max_gifs_to_check=10):
+    """
+    Check GIFs one by one from the channel using their tags from API.
+    
+    Logic:
+    1. For each GIF, get its tags from Giphy API (via GIF detail endpoint)
+    2. For each tag, search Giphy and check if that SAME GIF appears in results
+    3. Count how many tags return that same GIF
+    4. If 5+ tags return the same GIF → WORKING
+    5. If no GIFs from channel appear → SHADOW BANNED
+    
+    Returns:
+        {
+            'gifs_checked': int,
+            'gifs_with_5_plus_tags': int,  # GIFs where 5+ tags returned that GIF
+            'total_tags_tested': int,
+            'total_tags_found': int,  # Total tags that returned channel GIFs
+            'is_working': bool,  # True if at least one GIF has 5+ tags found
+            'gifs_details': list  # Details for each GIF checked
+        }
+    """
+    try:
+        if not GIPHY_API_KEY or GIPHY_API_KEY == 'dc6zaTOxFJmzC':
+            return None
+        
+        if not all_gifs_list or len(all_gifs_list) == 0:
+            return {
+                'gifs_checked': 0,
+                'gifs_with_5_plus_tags': 0,
+                'total_tags_tested': 0,
+                'total_tags_found': 0,
+                'is_working': False,
+                'gifs_details': []
+            }
+        
+        search_url = f"{GIPHY_API_BASE}/gifs/search"
+        gif_detail_url = f"{GIPHY_API_BASE}/gifs"
+        channel_id_lower = channel_id.lower()
+        
+        gifs_to_check = all_gifs_list[:max_gifs_to_check]
+        gifs_with_5_plus_tags = 0
+        total_tags_tested = 0
+        total_tags_found = 0
+        gifs_details = []
+        
+        print(f"  Checking {len(gifs_to_check)} GIFs one by one with their tags from API...")
+        
+        for idx, gif_data in enumerate(gifs_to_check, 1):
+            gif_id = gif_data.get('id')
+            if not gif_id:
+                continue
+            
+            print(f"\n  [{idx}/{len(gifs_to_check)}] Checking GIF: {gif_id[:12]}...")
+            
+            # Get tags from GIF detail endpoint (tags are in the API response)
+            tags = []
+            try:
+                detail_params = {'api_key': GIPHY_API_KEY}
+                detail_response = _requests_session.get(f"{gif_detail_url}/{gif_id}", params=detail_params, timeout=10)
+                
+                if detail_response.status_code == 200:
+                    gif_detail = detail_response.json().get('data', {})
+                    # Tags can be in different formats - check multiple possible fields
+                    tags_raw = gif_detail.get('tags', []) or []
+                    
+                    # Handle tags - they might be strings or objects
+                    if tags_raw:
+                        for tag_item in tags_raw:
+                            if isinstance(tag_item, str):
+                                # Remove # if present
+                                tag_clean = tag_item.replace('#', '').strip().lower()
+                                if tag_clean:
+                                    tags.append(tag_clean)
+                            elif isinstance(tag_item, dict):
+                                # Tags might be objects with 'text' field
+                                tag_text = tag_item.get('text', tag_item.get('name', ''))
+                                if tag_text:
+                                    tag_clean = str(tag_text).replace('#', '').strip().lower()
+                                    if tag_clean:
+                                        tags.append(tag_clean)
+                    
+                    # If no tags found in 'tags' field, try extracting from slug/URL
+                    if not tags:
+                        url = gif_detail.get('url', gif_data.get('url', ''))
+                        if url:
+                            url_match = re.search(r'giphy\.com/gifs/[^/]+-([^-]+(?:-[^-]+)*?)-([A-Za-z0-9]+)$', url)
+                            if url_match:
+                                slug_parts = url_match.group(1).split('-')
+                                tags = [t.lower() for t in slug_parts if t and len(t) >= 2][:10]
+                
+            except Exception as e:
+                print(f"    ⚠️  Error fetching tags for GIF {gif_id[:12]}...: {str(e)[:50]}")
+                continue
+            
+            if not tags:
+                print(f"    ⚠️  No tags found for GIF {gif_id[:12]}...")
+                gifs_details.append({
+                    'gif_id': gif_id,
+                    'tags': [],
+                    'tags_tested': 0,
+                    'tags_found': 0,
+                    'is_working': False
+                })
+                continue
+            
+            print(f"    Found {len(tags)} tags: {tags[:5]}{'...' if len(tags) > 5 else ''}")
+            
+            # Test each tag - check if this SAME GIF appears in search results
+            tags_found_count = 0
+            tags_tested_count = 0
+            tags_found_list = []
+            tags_not_found_list = []
+            
+            for tag in tags[:5]:  # Limit to maximum 5 tags per GIF
+                if not tag or len(tag.strip()) < 2:
+                    continue
+                
+                try:
+                    search_params = {
+                        'api_key': GIPHY_API_KEY,
+                        'q': tag.strip(),
+                        'limit': 50  # Check more results to find GIFs from same channel
+                    }
+                    
+                    tags_tested_count += 1
+                    total_tags_tested += 1
+                    
+                    response = _requests_session.get(search_url, params=search_params, timeout=10)
+                    
+                    if response.status_code == 200:
+                        search_results = response.json().get('data', [])
+                        
+                        # Check if ANY GIFs from the same channel appear in search results
+                        channel_gif_found = False
+                        matching_gif_ids = []
+                        for result_gif in search_results:
+                            result_gif_user = result_gif.get('user')
+                            if result_gif_user:
+                                result_username = result_gif_user.get('username', '').lower()
+                                if result_username == channel_id_lower:
+                                    channel_gif_found = True
+                                    result_gif_id = result_gif.get('id')
+                                    if result_gif_id:
+                                        matching_gif_ids.append(result_gif_id)
+                        
+                        if channel_gif_found:
+                            tags_found_count += 1
+                            total_tags_found += 1
+                            tags_found_list.append(tag)
+                            matching_count = len(matching_gif_ids)
+                            print(f"      ✓ Tag '{tag}': Found {matching_count} GIF(s) from same channel in search results")
+                        else:
+                            tags_not_found_list.append(tag)
+                            print(f"      ✗ Tag '{tag}': No GIFs from same channel found in search results")
+                    
+                    time.sleep(0.2)  # Small delay to avoid rate limiting
+                    
+                except Exception as e:
+                    print(f"      ⚠️  Error testing tag '{tag}': {str(e)[:50]}")
+                    tags_not_found_list.append(tag)
+                    continue
+            
+            # Check if this GIF is working (at least 1 tag found GIFs from same channel)
+            # If any tag returns GIFs from the same channel, this GIF is working
+            is_gif_working = tags_found_count > 0
+            if is_gif_working:
+                gifs_with_5_plus_tags += 1  # Keep variable name for compatibility, but now means "GIFs with any tags found"
+            
+            gifs_details.append({
+                'gif_id': gif_id,
+                'tags': tags[:5],  # Store first 5 tags (maximum)
+                'tags_tested': tags_tested_count,
+                'tags_found': tags_found_count,
+                'tags_found_list': tags_found_list,
+                'tags_not_found_list': tags_not_found_list,
+                'is_working': is_gif_working
+            })
+            
+            status_icon = "✅" if is_gif_working else "❌"
+            print(f"    {status_icon} GIF result: {tags_found_count}/{tags_tested_count} tags found GIFs from same channel ({'WORKING' if is_gif_working else 'NOT WORKING'})")
+            
+            # Small delay between GIFs
+            if idx < len(gifs_to_check):
+                time.sleep(0.3)
+        
+        # Determine overall status: WORKING if at least one GIF has tags that return GIFs from same channel
+        # If any GIF has any tag that returns GIFs from same channel → WORKING
+        # Otherwise → SHADOW BANNED
+        is_working = gifs_with_5_plus_tags > 0
+        
+        print(f"\n  Summary:")
+        print(f"    GIFs checked: {len(gifs_details)}")
+        print(f"    GIFs with tags found (same channel): {gifs_with_5_plus_tags}")
+        print(f"    Total tags tested: {total_tags_tested}")
+        print(f"    Total tags found: {total_tags_found}")
+        print(f"    Overall status: {'✅ WORKING' if is_working else '❌ SHADOW BANNED'}")
+        
+        return {
+            'gifs_checked': len(gifs_details),
+            'gifs_with_5_plus_tags': gifs_with_5_plus_tags,
+            'total_tags_tested': total_tags_tested,
+            'total_tags_found': total_tags_found,
+            'is_working': is_working,
+            'gifs_details': gifs_details
+        }
+        
+    except Exception as e:
+        return {'error': str(e)}
+    
+    return None
+
 def check_tags_in_search_results(tags_list, channel_id, sample_gif_ids=None):
     """
     Check if GIF tags from channel appear in Giphy search results.
@@ -1863,7 +3814,7 @@ def check_tags_in_search_results(tags_list, channel_id, sample_gif_ids=None):
                     'limit': 25
                 }
                 
-                response = requests.get(search_url, params=search_params, timeout=10)
+                response = _requests_session.get(search_url, params=search_params, timeout=10)
                 
                 if response.status_code == 200:
                     search_results = response.json().get('data', [])
@@ -1979,7 +3930,7 @@ def check_channel_in_search_results(channel_id, sample_gif_ids=None, all_gifs_li
                 }
                 
                 search_queries_tested.append(query)
-                response = requests.get(search_url, params=search_params, timeout=10)
+                response = _requests_session.get(search_url, params=search_params, timeout=10)
                 
                 if response.status_code == 200:
                     search_results = response.json().get('data', [])
@@ -2046,7 +3997,7 @@ def check_channel_in_search_results(channel_id, sample_gif_ids=None, all_gifs_li
     
     return None
 
-def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=False, channel_id=None, auto_check_views=False, gifs_accessible_via_detail=None):
+def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=False, channel_id=None, auto_check_views=False, gifs_accessible_via_detail=None, uploads_from_page=None, views_from_page=None):
     """
     Analyze channel status using multiple indicators (Search Results + View Trends).
     
@@ -2096,16 +4047,59 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
     total_uploads = len(all_gifs_list) if all_gifs_list else 0
     gifs_count = len([g for g in all_gifs_list if not g.get('is_sticker')]) if all_gifs_list else 0
     
+    # Use uploads_from_page if available (from web scraping)
+    if uploads_from_page is not None:
+        total_uploads = uploads_from_page
+    
     print(f"\n{'='*50}")
-    print(f"ANALYZING CHANNEL STATUS (Search Results + View Trends)")
+    print(f"ANALYZING CHANNEL STATUS (Step-by-Step Logic)")
     print(f"{'='*50}")
+    print(f"Channel ID: {channel_id}")
+    print(f"Uploads from page: {uploads_from_page}")
+    print(f"Views from page: {views_from_page}")
     print(f"Total uploads: {total_uploads} ({gifs_count} GIFs)")
     print(f"User ID available: {user_id is not None}")
     print(f"GIFs endpoint 404: {gifs_endpoint_404}")
     
+    # ===================================================================
+    # STEP 1: Check if page shows upload count and views count from channel URL
+    # ===================================================================
+    # BANNED = Page shows 0 uploads AND 0 views (page doesn't display metrics)
+    # If page shows metrics (upload_count > 0 OR views_count > 0) → Continue to STEP 2
+    
+    print("STEP 1: Checking if page shows upload count and views count...")
+    
+    # Check if page shows metrics (from web scraping)
+    # - None = extraction failed (page exists but we couldn't extract)
+    # - 0 = page shows 0 (BANNED - page doesn't display metrics)
+    # - >0 = page shows metrics (continue analysis)
+    page_shows_zero_uploads = uploads_from_page is not None and uploads_from_page == 0
+    page_shows_zero_views = views_from_page is not None and views_from_page == 0
+    page_shows_no_metrics = page_shows_zero_uploads and page_shows_zero_views
+    
+    # STEP 1: Check if page shows upload count and views count
+    if page_shows_no_metrics:
+        # Page shows 0 uploads and 0 views - BANNED
+        analysis['banned'] = True
+        analysis['working'] = False
+        analysis['shadow_banned'] = False
+        analysis['status'] = 'banned'
+        analysis['analysis_reasons'].append('🚫 BANNED: Channel page does NOT show GIF count and views count (page shows 0 uploads and 0 views)')
+        print("  🚫 BANNED: Channel page does NOT show GIF count and views count")
+        print("     Page shows 0 uploads and 0 views - channel is banned")
+        return analysis
+    
+    # If page shows metrics (uploads > 0 OR views > 0), continue analysis
+    if uploads_from_page is not None and uploads_from_page > 0:
+        print(f"  ✓ Page shows {uploads_from_page} uploads")
+    if views_from_page is not None and views_from_page > 0:
+        print(f"  ✓ Page shows {views_from_page:,} views")
+    
     # Factor 1: BANNED - Channel not found, content not visible, NO VIEWS
     # BANNED = Channel shows nothing, no views, no content accessible
-    if not user_data or total_uploads == 0:
+    # BUT: If page shows metrics, it's NOT banned (even if API doesn't return data)
+    if not user_data and total_uploads == 0 and (uploads_from_page is None and views_from_page is None):
+        # No data from API and no metrics from page - might be banned
         analysis['banned'] = True
         analysis['working'] = False
         analysis['shadow_banned'] = False
@@ -2117,71 +4111,135 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
     # Get GIF IDs for analysis
     gif_ids = [gif.get('id') for gif in all_gifs_list if gif.get('id')]
     
+    # If no GIFs from API but page shows metrics, try to fetch GIFs via API search
+    # so we can check tags (same logic as channels found via API)
     if not gif_ids:
-        analysis['status'] = 'unknown'
-        analysis['analysis_reasons'].append('No GIF IDs available for analysis')
-        return analysis
+        # If page shows metrics (uploads > 0 AND views > 0), try to fetch GIFs for tag checking
+        if (uploads_from_page is not None and uploads_from_page > 0) and (views_from_page is not None and views_from_page > 0):
+            print("  ⚠️  No GIFs from API but page shows metrics - fetching GIFs for tag checking...")
+            # Try to fetch GIFs using username parameter (same as Method 1 in check_channel_status)
+            try:
+                if GIPHY_API_KEY and GIPHY_API_KEY != 'dc6zaTOxFJmzC' and channel_id:
+                    gifs_search_url = f"{GIPHY_API_BASE}/gifs/search"
+                    gifs_search_params = {
+                        'api_key': GIPHY_API_KEY,
+                        'q': '',  # Empty query
+                        'username': channel_id,  # Search by username
+                        'limit': 25
+                    }
+                    gifs_response = _requests_session.get(gifs_search_url, params=gifs_search_params, timeout=10)
+                    if gifs_response.status_code == 200:
+                        gifs_data = gifs_response.json()
+                        fetched_gifs = gifs_data.get('data', [])
+                        # Filter to only GIFs from the correct channel
+                        matching_gifs = []
+                        for gif in fetched_gifs:
+                            gif_user = gif.get('user')
+                            if gif_user and gif_user.get('username', '').lower() == channel_id.lower():
+                                matching_gifs.append(gif)
+                        
+                        if matching_gifs:
+                            print(f"  ✓ Fetched {len(matching_gifs)} GIFs from API for tag checking")
+                            all_gifs_list = matching_gifs
+                            gif_ids = [gif.get('id') for gif in all_gifs_list if gif.get('id')]
+                        else:
+                            print(f"  ⚠️  No matching GIFs found via API search (page shows metrics but API returned no GIFs)")
+            except Exception as e:
+                print(f"  ⚠️  Error fetching GIFs for tag checking: {str(e)[:50]}")
+        
+        # If still no GIFs but page shows metrics, continue to search visibility check below
+        if not gif_ids:
+            if (uploads_from_page is not None and uploads_from_page > 0) or (views_from_page is not None and views_from_page > 0):
+                print("  ⚠️  No GIFs available but page shows metrics - checking search visibility with channel name...")
+                # Continue to search visibility check below (will use channel name only)
+            else:
+                # No GIFs and no metrics from page - cannot determine
+                analysis['status'] = 'unknown'
+                analysis['analysis_reasons'].append('No GIF IDs available for analysis and no metrics from page')
+                return analysis
     
-    # PRIMARY CHECK: Search Result Visibility
-    # Check if channel GIFs appear in general search results (we'll combine with view trends)
+    # ===================================================================
+    # STEP 3 & 4: Check GIFs one by one with their tags from API
+    # For each GIF: get tags from API, search each tag, check if same GIF appears
+    # If 5+ tags return the same GIF → WORKING
+    # If no GIFs from channel appear → SHADOW BANNED
+    # ===================================================================
     print(f"\n{'='*50}")
-    print(f"CHECK 1: Search Result Visibility")
+    print(f"STEP 3 & 4: Check GIFs one by one with tags from API")
     print(f"{'='*50}")
     
     search_visibility = None
     visible_in_search = False
+    tags_visible_count = 0
+    
     if channel_id:
         try:
-            print(f"  Checking if channel '{channel_id}' appears in Giphy search results...")
-            print(f"  Testing channel name + keywords extracted from GIF titles/URLs...")
-            search_visibility = check_channel_in_search_results(
-                channel_id, 
-                sample_gif_ids=gif_ids[:10] if gif_ids else None,
-                all_gifs_list=all_gifs_list
-            )
-            
-            if search_visibility and not search_visibility.get('error'):
-                visible_in_search = search_visibility.get('visible_in_search', False)
-                matching_count = search_visibility.get('matching_gifs_count', 0)
-                successful_queries = search_visibility.get('successful_queries', [])
-                queries_tested = search_visibility.get('search_queries_tested', [])
+            # If we have GIFs, check them one by one with their tags
+            if all_gifs_list and len(all_gifs_list) > 0:
+                print(f"  Checking GIFs from channel '{channel_id}' one by one...")
+                print(f"  For each GIF: get maximum 5 tags from API, search each tag, check if GIFs from same channel appear")
+                print(f"  If any tag returns GIFs from same channel → WORKING")
                 
-                if visible_in_search:
-                    successful_query_list = [q['query'] for q in successful_queries]
-                    queries_str = ', '.join(successful_query_list[:3])
-                    if len(successful_query_list) > 3:
-                        queries_str += f' (+{len(successful_query_list) - 3} more)'
-                    print(f"  ✅ SEARCH RESULT: VISIBLE")
-                    print(f"     Found {matching_count} matching GIFs across {len(successful_queries)} successful search queries")
-                    print(f"     Successful queries: {queries_str}")
+                # Check GIFs one by one with their tags
+                gifs_check_result = check_gifs_one_by_one_with_tags(all_gifs_list, channel_id, max_gifs_to_check=10)
+                
+                if gifs_check_result and not gifs_check_result.get('error'):
+                    visible_in_search = gifs_check_result.get('is_working', False)
+                    gifs_with_5_plus_tags = gifs_check_result.get('gifs_with_5_plus_tags', 0)
+                    total_tags_found = gifs_check_result.get('total_tags_found', 0)
+                    total_tags_tested = gifs_check_result.get('total_tags_tested', 0)
+                    tags_visible_count = total_tags_found
                     
-                    # If visible in search, also check tags from URLs
-                    if all_gifs_list and len(all_gifs_list) > 0:
-                        print(f"\n  Checking tags from GIF URLs...")
-                        tags_list = extract_tags_from_gif_urls(all_gifs_list, max_tags=10)
-                        if tags_list and len(tags_list) > 0:
-                            print(f"  Extracted {len(tags_list)} tags from GIF URLs: {tags_list[:5]}...")
-                            tags_result = check_tags_in_search_results(tags_list, channel_id, sample_gif_ids=gif_ids[:10] if gif_ids else None)
-                            if tags_result and not tags_result.get('error'):
-                                tags_found = tags_result.get('tags_found', 0)
-                                tags_tested = tags_result.get('tags_tested', 0)
-                                search_visibility['tags_check'] = tags_result
-                                print(f"  Tags check result: {tags_found}/{tags_tested} tags found channel GIFs in search")
-                        else:
-                            print(f"  No tags extracted from GIF URLs")
+                    search_visibility = {
+                        'visible_in_search': visible_in_search,
+                        'gifs_with_5_plus_tags': gifs_with_5_plus_tags,
+                        'total_tags_found': total_tags_found,
+                        'total_tags_tested': total_tags_tested,
+                        'gifs_details': gifs_check_result.get('gifs_details', [])
+                    }
+                    
+                    if visible_in_search:
+                        print(f"\n  ✅ SEARCH RESULT: VISIBLE")
+                        print(f"     {gifs_with_5_plus_tags} GIF(s) have tags that return GIFs from same channel in search")
+                        print(f"     Total: {total_tags_found}/{total_tags_tested} tags found channel GIFs in search")
+                    else:
+                        print(f"\n  👻 SEARCH RESULT: NOT VISIBLE")
+                        print(f"     No GIFs have tags that return GIFs from same channel in search")
+                        print(f"     Total: {total_tags_found}/{total_tags_tested} tags found channel GIFs in search")
+                    
+                    analysis['search_visibility'] = search_visibility
                 else:
-                    queries_str = ', '.join(queries_tested[:5])
-                    if len(queries_tested) > 5:
-                        queries_str += f' (+{len(queries_tested) - 5} more)'
-                    print(f"  👻 SEARCH RESULT: NOT VISIBLE")
-                    print(f"     Tested {len(queries_tested)} search queries, no matching GIFs found")
-                
-                analysis['search_visibility'] = search_visibility
+                    error_msg = gifs_check_result.get('error', 'Unknown error') if gifs_check_result else 'No result'
+                    print(f"  ⚠️  GIFs check failed: {error_msg}")
             else:
-                error_msg = search_visibility.get('error', 'Unknown error') if search_visibility else 'No result'
-                print(f"  ⚠️  Search visibility check failed: {error_msg}")
+                # No GIFs available - check channel name in search as fallback
+                print(f"  No GIFs available from API - checking channel name in search...")
+                search_visibility_result = check_channel_in_search_results(channel_id, sample_gif_ids=None, all_gifs_list=None)
+                if search_visibility_result and not search_visibility_result.get('error'):
+                    visible_in_search = search_visibility_result.get('visible_in_search', False)
+                    matching_count = search_visibility_result.get('matching_gifs_count', 0)
+                    
+                    search_visibility = {
+                        'visible_in_search': visible_in_search,
+                        'gifs_with_5_plus_tags': 1 if visible_in_search else 0,
+                        'total_tags_found': 1 if visible_in_search else 0,
+                        'total_tags_tested': 1,
+                        'gifs_details': []
+                    }
+                    
+                    if visible_in_search:
+                        print(f"\n  ✅ SEARCH RESULT: VISIBLE")
+                        print(f"     Channel name found in search ({matching_count} GIFs)")
+                        tags_visible_count = 1
+                    else:
+                        print(f"\n  👻 SEARCH RESULT: NOT VISIBLE")
+                        print(f"     Channel name not found in search")
+                    
+                    analysis['search_visibility'] = search_visibility
+                else:
+                    print(f"  ⚠️  Search check failed")
         except Exception as e:
-            print(f"  ⚠️  Search visibility check error: {str(e)}")
+            print(f"  ⚠️  GIFs check error: {str(e)}")
     
     print(f"\n{'='*50}")
     print(f"CHECK 2: View Trends Analysis")
@@ -3127,17 +5185,18 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
         else:
             print(f"  View Trend: ⚠️  No previous data available")
         
-        # Check tags visibility if available
-        tags_check = search_visibility.get('tags_check') if search_visibility else None
-        tags_working = False
-        if tags_check and not tags_check.get('error'):
-            tags_found = tags_check.get('tags_found', 0)
-            tags_working = tags_check.get('is_working', False)  # True if 5+ tags found
-            if tags_working:
-                print(f"  Tags Visibility: ✅ {tags_found} tags found in search (5+ tags = WORKING)")
+        # Check tags visibility if available (from new GIF-by-GIF check)
+        if search_visibility:
+            gifs_with_5_plus = search_visibility.get('gifs_with_5_plus_tags', 0)
+            total_tags_found = search_visibility.get('total_tags_found', 0)
+            total_tags_tested = search_visibility.get('total_tags_tested', 0)
+            if gifs_with_5_plus > 0:
+                print(f"  GIFs with 5+ tags: ✅ {gifs_with_5_plus} GIF(s)")
+            if total_tags_found > 0:
+                print(f"  Tags Visibility: ✅ {total_tags_found}/{total_tags_tested} tags found channel GIFs in search")
         
-        # WORKING if: Visible in search OR (5+ tags found in search)
-        if visible_in_search or tags_working:
+        # WORKING if: Visible in search (at least one GIF has 5+ tags that return it)
+        if visible_in_search:
             # WORKING: Channel visible in search results (regardless of view trends)
             analysis['working'] = True
             analysis['status'] = 'working'
@@ -3146,18 +5205,16 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
             
             reason_parts = []
             if visible_in_search:
-                reason_parts.append('visible in search results')
-            if tags_working:
-                reason_parts.append(f'{tags_check.get("tags_found", 0)} tags found in search')
-            if yesterday_data_available:
-                if views_difference < 0:
-                    reason_parts.append(f'views decreased ({views_difference:,} views) - normal fluctuation')
-                elif views_increasing:
-                    reason_parts.append(f'views increasing (+{views_difference:,} views)')
+                gifs_with_5_plus = search_visibility.get('gifs_with_5_plus_tags', 0) if search_visibility else 0
+                if gifs_with_5_plus > 0:
+                    reason_parts.append(f'{gifs_with_5_plus} GIF(s) have 5+ tags that return them in search')
+                else:
+                    reason_parts.append('visible in search results')
             
             reason_str = ' AND '.join(reason_parts)
             analysis['analysis_reasons'].append(f'✅ WORKING: Channel {reason_str}')
-            print(f"  ✅ FINAL STATUS: WORKING (Visible in search{' + Tags visible' if tags_working else ''})")
+            gifs_with_5_plus = search_visibility.get('gifs_with_5_plus_tags', 0) if search_visibility else 0
+            print(f"  ✅ FINAL STATUS: WORKING ({gifs_with_5_plus} GIF(s) have 5+ tags that return them in search)")
         elif not visible_in_search or (yesterday_data_available and views_stagnant):
             # SHADOW BANNED: Views stagnant (but visible in search - this shouldn't happen due to earlier check, but keep as fallback)
             analysis['shadow_banned'] = True
@@ -3165,8 +5222,10 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
             analysis['banned'] = False
             analysis['status'] = 'shadow_banned'
             reasons = [f'views stagnant (no increase, {views_difference:+,} views)']
-            if tags_check and tags_check.get('tags_found', 0) < 5:
-                reasons.append(f'only {tags_check.get("tags_found", 0)} tags found in search (need 5+)')
+            if search_visibility:
+                gifs_with_5_plus = search_visibility.get('gifs_with_5_plus_tags', 0)
+                if gifs_with_5_plus == 0:
+                    reasons.append('no GIFs have 5+ tags that return them in search')
             reason_str = ' and '.join(reasons)
             analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Channel {reason_str}')
             print(f"  👻 FINAL STATUS: SHADOW BANNED ({reason_str})")
@@ -3267,7 +5326,7 @@ def check_channel_status(channel_identifier, original_url=None):
                         'offset': offset
                     }
                     
-                    gifs_search_response = requests.get(gifs_search_url, params=gifs_search_params, timeout=10)
+                    gifs_search_response = _requests_session.get(gifs_search_url, params=gifs_search_params, timeout=10)
                     
                     if gifs_search_response.status_code == 200:
                         gifs_data = gifs_search_response.json()
@@ -3306,7 +5365,7 @@ def check_channel_status(channel_identifier, original_url=None):
                         'offset': stickers_offset
                     }
                     
-                    stickers_search_response = requests.get(stickers_search_url, params=stickers_search_params, timeout=10)
+                    stickers_search_response = _requests_session.get(stickers_search_url, params=stickers_search_params, timeout=10)
                     
                     if stickers_search_response.status_code == 200:
                         stickers_data = stickers_search_response.json()
@@ -3394,7 +5453,7 @@ def check_channel_status(channel_identifier, original_url=None):
                 }
                 
                 print(f"  Query: {channel_identifier}")
-                gifs_search_response = requests.get(gifs_search_url, params=gifs_search_params, timeout=10)
+                gifs_search_response = _requests_session.get(gifs_search_url, params=gifs_search_params, timeout=10)
                 print(f"  Response Status: {gifs_search_response.status_code}")
                 
                 if gifs_search_response.status_code == 200:
@@ -3428,7 +5487,7 @@ def check_channel_status(channel_identifier, original_url=None):
                     'api_key': GIPHY_API_KEY
                 }
                 
-                direct_user_response = requests.get(direct_user_url, params=direct_user_params, timeout=10)
+                direct_user_response = _requests_session.get(direct_user_url, params=direct_user_params, timeout=10)
                 print(f"  Response Status: {direct_user_response.status_code}")
                 
                 if direct_user_response.status_code == 200:
@@ -3493,7 +5552,7 @@ def check_channel_status(channel_identifier, original_url=None):
                 
                 print(f"\nFetching GIFs for user_id: {user_id}")
                 print(f"GIFs URL: {gifs_url}")
-                gifs_response = requests.get(gifs_url, params=gifs_params, timeout=15)
+                gifs_response = _requests_session.get(gifs_url, params=gifs_params, timeout=15)
                 print(f"GIFs Response Status: {gifs_response.status_code}")
                 
                 if gifs_response.status_code == 200:
@@ -3530,7 +5589,7 @@ def check_channel_status(channel_identifier, original_url=None):
                                 break
                             
                             gifs_params['offset'] = offset
-                            more_gifs_response = requests.get(gifs_url, params=gifs_params, timeout=10)
+                            more_gifs_response = _requests_session.get(gifs_url, params=gifs_params, timeout=10)
                             
                             if more_gifs_response.status_code == 200:
                                 more_gifs_data = more_gifs_response.json()
@@ -3585,7 +5644,7 @@ def check_channel_status(channel_identifier, original_url=None):
                                 gif_detail_params = {
                                     'api_key': GIPHY_API_KEY
                                 }
-                                gif_detail_response = requests.get(gif_detail_url, params=gif_detail_params, timeout=5)
+                                gif_detail_response = _requests_session.get(gif_detail_url, params=gif_detail_params, timeout=5)
                                 
                                 if gif_detail_response.status_code == 200:
                                     accessible_gifs += 1
@@ -3790,7 +5849,7 @@ def check_channel_status(channel_identifier, original_url=None):
                                 is_accessible = False
                                 try:
                                     gif_detail_url = f"{GIPHY_API_BASE}/gifs/{gif_id}"
-                                    gif_detail_response = requests.get(gif_detail_url, params={'api_key': GIPHY_API_KEY}, timeout=5)
+                                    gif_detail_response = _requests_session.get(gif_detail_url, params={'api_key': GIPHY_API_KEY}, timeout=5)
                                     if gif_detail_response.status_code == 200:
                                         is_accessible = True
                                         if idx < sample_size:
@@ -3969,7 +6028,7 @@ def check_channel_status(channel_identifier, original_url=None):
                             try:
                                 gif_detail_url = f"{GIPHY_API_BASE}/gifs/{gif_id}"
                                 gif_detail_params = {'api_key': GIPHY_API_KEY}
-                                gif_detail_response = requests.get(gif_detail_url, params=gif_detail_params, timeout=5)
+                                gif_detail_response = _requests_session.get(gif_detail_url, params=gif_detail_params, timeout=5)
                                 
                                 if gif_detail_response.status_code == 200:
                                     gif_detail = gif_detail_response.json().get('data', {})
@@ -4085,7 +6144,7 @@ def check_channel_status(channel_identifier, original_url=None):
                     'limit': 10
                 }
                 
-                gifs_by_user_response = requests.get(gifs_by_user_url, params=gifs_by_user_params, timeout=10)
+                gifs_by_user_response = _requests_session.get(gifs_by_user_url, params=gifs_by_user_params, timeout=10)
                 
                 if gifs_by_user_response.status_code == 200:
                     gifs_data = gifs_by_user_response.json()
@@ -4131,7 +6190,7 @@ def check_channel_status(channel_identifier, original_url=None):
                                     'offset': 0
                                 }
                                 
-                                gifs_response = requests.get(gifs_url, params=gifs_params, timeout=10)
+                                gifs_response = _requests_session.get(gifs_url, params=gifs_params, timeout=10)
                                 if gifs_response.status_code == 200:
                                     gifs_list_data = gifs_response.json()
                                     gifs_list = gifs_list_data.get('data', [])
@@ -4162,11 +6221,41 @@ def check_channel_status(channel_identifier, original_url=None):
             # Method 2: Try web scraping if GIF search didn't work
             if not found_via_gifs and original_url:
                 web_result = check_channel_via_web_scraping(channel_identifier, original_url)
-                if web_result.get('exists') or web_result.get('working'):
+                # Check if web scraping found the page (exists) or found metrics
+                uploads_from_page = web_result.get('uploads_from_page') or web_result.get('details', {}).get('uploads_from_page')
+                views_from_page = web_result.get('views_from_page') or web_result.get('details', {}).get('views_from_page')
+                
+                if web_result.get('exists') or web_result.get('working') or (uploads_from_page is not None or views_from_page is not None):
+                    # If web scraping found the page, analyze the status properly
+                    # Even if metrics extraction failed, if page exists, we should check search visibility
+                    if web_result.get('exists') and not web_result.get('banned'):
+                        # Get GIFs list from the page (extracted from __NEXT_DATA__)
+                        all_gifs_list = web_result.get('details', {}).get('all_gifs', [])
+                        user_data = None
+                        if web_result.get('details', {}).get('user_id'):
+                            user_data = {'id': web_result.get('details', {}).get('user_id')}
+                        
+                        # Analyze status with extracted metrics and GIFs from the page
+                        # This ensures we only check tags from GIFs that belong to this channel
+                        analysis_result = analyze_channel_status(
+                            user_data, 
+                            all_gifs_list, 
+                            web_result.get('details', {}).get('user_id'),
+                            False,  # gifs_endpoint_404
+                            channel_identifier,
+                            auto_check_views=False,
+                            gifs_accessible_via_detail=None,
+                            uploads_from_page=uploads_from_page,
+                            views_from_page=views_from_page
+                        )
+                        web_result.update(analysis_result)
+                    
                     return web_result
             
-            # Method 3: Try general GIF search with channel name (search for GIFs by this username)
-            if not found_via_gifs:
+            # Method 3: Try general GIF search with channel name (ONLY if web scraping didn't find the page)
+            # Skip this if web scraping already found the page - we don't want to use GIFs from other users
+            web_scraping_found_page = 'web_result' in locals() and (web_result.get('exists') or web_result.get('uploads_from_page') is not None or web_result.get('views_from_page') is not None)
+            if not found_via_gifs and not web_scraping_found_page:
                 try:
                     gifs_search_url = f"{GIPHY_API_BASE}/gifs/search"
                     gifs_search_params = {
@@ -4174,7 +6263,7 @@ def check_channel_status(channel_identifier, original_url=None):
                         'q': channel_identifier,
                         'limit': 25  # Get more GIFs
                     }
-                    gifs_search_response = requests.get(gifs_search_url, params=gifs_search_params, timeout=10)
+                    gifs_search_response = _requests_session.get(gifs_search_url, params=gifs_search_params, timeout=10)
                     
                     if gifs_search_response.status_code == 200:
                         gifs_data = gifs_search_response.json()
@@ -4222,7 +6311,7 @@ def check_channel_status(channel_identifier, original_url=None):
                                         'offset': 0
                                     }
                                     
-                                    gifs_response = requests.get(gifs_url, params=gifs_params, timeout=15)
+                                    gifs_response = _requests_session.get(gifs_url, params=gifs_params, timeout=15)
                                     if gifs_response.status_code == 200:
                                         user_gifs_data = gifs_response.json()
                                         user_gifs_list = user_gifs_data.get('data', [])
@@ -4295,7 +6384,7 @@ def check_channel_status(channel_identifier, original_url=None):
                                         try:
                                             gif_detail_url = f"{GIPHY_API_BASE}/gifs/{gif_id}"
                                             gif_detail_params = {'api_key': GIPHY_API_KEY}
-                                            gif_detail_response = requests.get(gif_detail_url, params=gif_detail_params, timeout=5)
+                                            gif_detail_response = _requests_session.get(gif_detail_url, params=gif_detail_params, timeout=5)
                                             
                                             if gif_detail_response.status_code == 200:
                                                 gif_detail = gif_detail_response.json().get('data', {})
@@ -4350,6 +6439,33 @@ def check_channel_status(channel_identifier, original_url=None):
                 try:
                     web_result = check_channel_via_web_scraping(channel_identifier, original_url)
                     if web_result.get('exists') or web_result.get('working') or web_result.get('status') != 'not_found':
+                        # If web scraping found the page, analyze the status properly
+                        # Even if metrics extraction failed, if page exists, we should check search visibility
+                        uploads_from_page = web_result.get('uploads_from_page') or web_result.get('details', {}).get('uploads_from_page')
+                        views_from_page = web_result.get('views_from_page') or web_result.get('details', {}).get('views_from_page')
+                        
+                        # If page exists and is not banned, analyze the status
+                        if web_result.get('exists') and not web_result.get('banned'):
+                            # Get GIFs list if available (might be empty if API failed)
+                            all_gifs_list = web_result.get('details', {}).get('all_gifs', [])
+                            user_data = None
+                            if web_result.get('details', {}).get('user_id'):
+                                user_data = {'id': web_result.get('details', {}).get('user_id')}
+                            
+                            # Analyze status with extracted metrics (even if None, analyze_channel_status will check search visibility)
+                            analysis_result = analyze_channel_status(
+                                user_data, 
+                                all_gifs_list, 
+                                web_result.get('details', {}).get('user_id'),
+                                False,  # gifs_endpoint_404
+                                channel_identifier,
+                                auto_check_views=False,
+                                gifs_accessible_via_detail=None,
+                                uploads_from_page=uploads_from_page,
+                                views_from_page=views_from_page
+                            )
+                            web_result.update(analysis_result)
+                        
                         return web_result
                 except Exception as e:
                     pass
@@ -4595,7 +6711,7 @@ def get_realtime_views():
     try:
         # Get GIF IDs for this channel
         gif_ids = []
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT gif_id FROM gifs WHERE channel_id = ?', (channel_id,))
         gif_ids = [row[0] for row in cursor.fetchall()]
@@ -4626,8 +6742,7 @@ def index():
 def check_channel():
     """
     API endpoint to check channel status.
-    Takes a Giphy channel URL, extracts the channel identifier,
-    and fetches all data using the Giphy API key.
+    Takes a Giphy channel URL and uses detect_channel_status to check status.
     """
     data = request.json
     url = data.get('url', '').strip()
@@ -4638,89 +6753,84 @@ def check_channel():
     if 'giphy.com' not in url.lower():
         return jsonify({'error': 'Please provide a valid Giphy URL'}), 400
     
-    # Extract channel identifier from the URL
-    channel_identifier = extract_channel_info_from_url(url)
-    
-    if not channel_identifier:
-        return jsonify({'error': 'Could not extract channel information from URL. Please check the URL format.'}), 400
-    
-    # Check channel status using API (all data comes from Giphy API)
-    results = check_channel_status(channel_identifier, original_url=url)
-    
-    # ALWAYS use view-based analysis for accurate results
-    # The analyze_channel_status function is already called in check_channel_status
-    # with auto_check_views=True, so it will automatically scrape views if needed
-    # and use strict 2-day analysis
-    
-    # Option: Multi-location check (most accurate, but slower)
-    use_location_check = data.get('use_location_check', False)
-    if use_location_check and results.get('exists') and results.get('details', {}).get('all_gifs'):
-        print(f"\n{'='*60}")
-        print(f"PERFORMING MULTI-LOCATION VIEW ANALYSIS (Most Accurate)")
-        print(f"{'='*60}")
+    try:
+        # Use detect_channel_status to check the channel
+        detector_result = detect_channel_status(url)
         
-        try:
-            location_analysis = analyze_channel_status_with_location_checks(channel_identifier, days=2)
-            
-            # OVERRIDE results with location-based analysis (most accurate)
-            results.update({
-                'status': location_analysis['status'],
-                'working': location_analysis.get('working', False),
-                'shadow_banned': location_analysis.get('shadow_banned', False),
-                'banned': location_analysis.get('banned', False),
-                'analysis_reasons': [location_analysis.get('reason', '')],
-                'location_analysis': location_analysis.get('stats', {}),
-                'analysis_method': 'multi_location_view_check_accurate'
-            })
-            
-            # Also update details for frontend display
-            if location_analysis.get('reason'):
-                results['details']['analysis_reasons'] = [location_analysis.get('reason')]
-            
-            print(f"Location-based analysis complete: {location_analysis['status']}")
-        except Exception as e:
-            print(f"Error in location-based analysis: {str(e)}")
-            results['location_analysis_error'] = str(e)
-            # Don't change status on error - keep original analysis
-    
-    # Optionally update view counts in background (non-blocking)
-    update_views = data.get('update_views', False)
-    if update_views and results.get('exists') and results.get('details', {}).get('all_gifs'):
-        # Start background thread to update views
-        def update_views_background():
-            try:
-                gif_ids = [gif.get('id') for gif in results['details']['all_gifs'] if gif.get('id')]
-                if gif_ids:
-                    print(f"  Updating views for {len(gif_ids)} GIFs in background...")
-                    update_gif_views_batch(gif_ids, max_workers=3)
-                    print(f"  ✓ Completed view updates")
-            except Exception as e:
-                print(f"  ✗ Error updating views in background: {str(e)}")
+        # Convert detector result format to match API response format
+        channel_username = detector_result.get('channel_username', '')
+        status = detector_result.get('status', 'unknown')
+        summary = detector_result.get('summary', {})
         
-        thread = threading.Thread(target=update_views_background)
-        thread.daemon = True
-        thread.start()
-    
-    # Add URL info to results for reference
-    results['source_url'] = url
-    results['channel_identifier_from_url'] = channel_identifier
-    
-    # Ensure channel_id is always set even if channel not found
-    if not results.get('channel_id'):
-        results['channel_id'] = channel_identifier
-    
-    # Debug: Print results to console
-    print(f"\n=== Channel Check Results ===")
-    print(f"Channel ID: {channel_identifier}")
-    print(f"Exists: {results.get('exists')}")
-    print(f"Status: {results.get('status')}")
-    print(f"GIFs found: {len(results.get('details', {}).get('all_gifs', []))}")
-    print(f"Method: {results.get('method')}")
-    if results.get('error'):
-        print(f"Error: {results.get('error')}")
-    print("=" * 30 + "\n")
-    
-    return jsonify(results)
+        # Get total_gifs and total_views from summary
+        # For BANNED channels: always 0 (API cannot fetch these values)
+        # For SHADOW BANNED channels: shows actual values from API (but GIFs not in search)
+        # For WORKING channels: shows actual values from API (and GIFs are in search)
+        total_gifs = summary.get('total_gifs', 0)
+        total_views = summary.get('total_views', 0)
+        
+        # Ensure banned channels always have 0 values
+        if status == 'banned':
+            total_gifs = 0
+            total_views = 0
+        
+        results = {
+            'channel_id': channel_username,
+            'exists': status != 'banned' and status != 'error',
+            'status': status,
+            'details': {
+                'channel_id': channel_username,
+                'username': channel_username,
+                'total_gifs': total_gifs,  # 0 for banned, actual value for shadow banned/working
+                'total_views': total_views,  # 0 for banned, actual value for shadow banned/working
+                'detection_method': 'channel_status_detector',
+                'banned_check': detector_result.get('banned_check'),
+                'shadow_banned_check': detector_result.get('shadow_banned_check'),
+                'working_check': detector_result.get('working_check'),
+                'summary': summary
+            },
+            'shadow_banned': status == 'shadow_banned',
+            'banned': status == 'banned',
+            'working': status == 'working',
+            'error': detector_result.get('error'),
+            'method': 'channel_status_detector',
+            'api_key_used': GIPHY_API_KEY[:10] + '...' if GIPHY_API_KEY else 'none',
+            'source_url': url
+        }
+        
+        # Add GIFs list if available from channel info
+        if detector_result.get('banned_check', {}).get('channel_info', {}).get('gifs_list'):
+            gifs_list = detector_result['banned_check']['channel_info']['gifs_list']
+            results['details']['all_gifs'] = [
+                {
+                    'id': gif.get('id'),
+                    'title': gif.get('title', ''),
+                    'views': gif.get('analytics', {}).get('onload', {}).get('count', 0),
+                    'url': gif.get('url', ''),
+                    'thumbnail_url': gif.get('images', {}).get('fixed_height_small', {}).get('url', ''),
+                    'preview_url': gif.get('images', {}).get('fixed_height', {}).get('url', '')
+                }
+                for gif in gifs_list[:50]  # Limit to first 50 for response size
+            ]
+        
+        # Debug: Print results to console
+        print(f"\n=== Channel Check Results ===")
+        print(f"Channel ID: {channel_username}")
+        print(f"Exists: {results.get('exists')}")
+        print(f"Status: {results.get('status')}")
+        print(f"GIFs found: {len(results.get('details', {}).get('all_gifs', []))}")
+        print(f"Method: {results.get('method')}")
+        if results.get('error'):
+            print(f"Error: {results.get('error')}")
+        print("=" * 30 + "\n")
+        
+        return jsonify(results)
+        
+    except Exception as e:
+        print(f"Error in check_channel: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Error checking channel: {str(e)}'}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
