@@ -40,7 +40,17 @@ pip install -r requirements.txt
    export GIPHY_API_KEY="your_api_key_here"
    ```
 
-4. **Run the application**:
+4. **Set up Notion integration**:
+   - The app reads Notion credentials from server configuration only.
+   - Add them to a `.env` file or use environment variables.
+   ```bash
+   # .env
+   NOTION_API_KEY="your_notion_api_key_here"
+   NOTION_DATABASE_ID="your_database_id_here"
+   GIPHY_API_KEY="your_giphy_api_key_here"
+   ```
+
+5. **Run the application**:
 ```bash
 python app.py
 ```

@@ -3,77 +3,111 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Giphy Channel Status Checker</title>
+    <title>Giphy Channel Status Dashboard</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
     <div class="container">
         <header>
             <h1>🎬 Giphy Channel Status Dashboard</h1>
-            <p class="subtitle">Check if your Giphy channel is shadow banned, banned, or working</p>
+            <p class="subtitle">Monitor Verified &amp; Declined channels — check working, shadow banned, or banned status</p>
         </header>
 
         <div class="dashboard">
+
+            <!-- Single channel check -->
             <div class="input-section">
                 <div class="input-group">
-                    <label for="giphy-url">Enter Giphy Channel URL:</label>
-                    <input 
-                        type="text" 
-                        id="giphy-url" 
-                        placeholder="https://giphy.com/username or https://giphy.com/channel/username"
-                        autocomplete="off"
-                    >
-                    <button id="check-btn" onclick="checkChannel()">
-                        <span id="btn-text">Check Status</span>
-                        <span id="btn-loader" class="loader" style="display: none;"></span>
-                    </button>
+                    <label for="giphy-url">Check a Single Channel URL:</label>
+                    <div class="input-row">
+                        <input
+                            type="text"
+                            id="giphy-url"
+                            placeholder="https://giphy.com/username"
+                            autocomplete="off"
+                        >
+                        <button id="check-btn" onclick="checkChannel()">
+                            <span id="btn-text">Check</span>
+                            <span id="btn-loader" class="loader" style="display:none;"></span>
+                        </button>
+                    </div>
                 </div>
-                <div class="examples">
-                    <p>Examples:</p>
-                    <ul>
-                        <li>https://giphy.com/username</li>
-                        <li>https://giphy.com/channel/username</li>
-                        <li>https://giphy.com/@username</li>
-                    </ul>
+
+                <div id="single-result" style="display:none; margin-top:16px;"></div>
+            </div>
+
+            <!-- Notion channel list -->
+            <div class="notion-section">
+                <div class="notion-header">
+                    <h2>Notion Channel List <span id="channel-count" class="count-badge"></span></h2>
+                    <div class="notion-controls">
+                        <div class="filter-group">
+                            <label>Filter:</label>
+                            <select id="status-filter" onchange="applyFilter()">
+                                <option value="all">All</option>
+                                <option value="Verified">Verified in Notion</option>
+                                <option value="Declined">Declined in Notion</option>
+                            </select>
+                            <select id="giphy-filter" onchange="applyFilter()">
+                                <option value="all">Any Giphy Status</option>
+                                <option value="working">Working</option>
+                                <option value="shadow_banned">Shadow Banned</option>
+                                <option value="banned">Banned</option>
+                                <option value="unchecked">Not Checked</option>
+                            </select>
+                        </div>
+                        <div class="action-buttons">
+                            <button id="load-btn" onclick="loadChannels()">
+                                <span id="load-btn-text">Load Channels</span>
+                                <span id="load-btn-loader" class="loader" style="display:none;"></span>
+                            </button>
+                            <button id="check-all-btn" onclick="checkAllChannels()" disabled>
+                                <span id="check-all-text">Check All Status</span>
+                                <span id="check-all-loader" class="loader" style="display:none;"></span>
+                            </button>
+                            <button id="stop-btn" onclick="stopChecking()" style="display:none;" class="btn-danger">Stop</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="summary-bar" class="summary-bar" style="display:none;">
+                    <span class="summary-item working-item">✅ Working: <strong id="s-working">0</strong></span>
+                    <span class="summary-item shadow-item">👻 Shadow Banned: <strong id="s-shadow">0</strong></span>
+                    <span class="summary-item banned-item">🚫 Banned: <strong id="s-banned">0</strong></span>
+                    <span class="summary-item error-item">⚠️ Error: <strong id="s-error">0</strong></span>
+                    <span class="summary-item pending-item">⏳ Pending: <strong id="s-pending">0</strong></span>
+                </div>
+
+                <div id="progress-bar-wrap" class="progress-bar-wrap" style="display:none;">
+                    <div class="progress-bar-track">
+                        <div id="progress-bar" class="progress-bar"></div>
+                    </div>
+                    <span id="progress-text" class="progress-text">0 / 0</span>
+                </div>
+
+                <div id="channels-table-wrap">
+                    <div id="channels-empty" class="empty-state">
+                        Click <strong>Load Channels</strong> to fetch your Notion channel list.
+                    </div>
+                    <table id="channels-table" class="channels-table" style="display:none;">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Channel Name</th>
+                                <th>Giphy URL</th>
+                                <th>Notion Status</th>
+                                <th>Giphy Status</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="channels-tbody"></tbody>
+                    </table>
                 </div>
             </div>
 
-            <div id="results-section" class="results-section" style="display: none;">
-                <div class="status-card">
-                    <div id="status-badge" class="status-badge">
-                        <span id="status-icon"></span>
-                        <span id="status-text">Checking...</span>
-                    </div>
-                </div>
-
-                <div class="details-grid">
-                    <div class="detail-card">
-                        <h3>Channel Information</h3>
-                        <div id="channel-info" class="info-content"></div>
-                    </div>
-
-                    <div class="detail-card" id="status-details-card" style="display: none;">
-                        <h3>Status Details</h3>
-                        <div id="status-details" class="info-content"></div>
-                    </div>
-
-                    <div class="detail-card">
-                        <h3>Status</h3>
-                        <div id="detection-results" class="info-content"></div>
-                    </div>
-                </div>
-            </div>
-
-            <div id="error-section" class="error-section" style="display: none;">
-                <div class="error-card">
-                    <span class="error-icon">⚠️</span>
-                    <p id="error-message"></p>
-                </div>
-            </div>
         </div>
     </div>
 
     <script src="{{ url_for('static', filename='script.js') }}"></script>
 </body>
 </html>
-

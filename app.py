@@ -12,6 +12,30 @@ from bs4 import BeautifulSoup
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Graceful shutdown event for background threads
+stop_event = threading.Event()
+
+# Replace builtin print with a safe wrapper to avoid interpreter-shutdown errors
+import builtins
+_orig_print = builtins.print
+def _safe_print(*args, **kwargs):
+    try:
+        _orig_print(*args, **kwargs)
+    except Exception:
+        pass
+builtins.print = _safe_print
+
+import signal
+
+# Optional Notion integration
+try:
+    from notion_client import Client
+except ImportError:
+    Client = None
 
 # Import alternative detection methods (will be set up after API config is defined)
 ALTERNATIVE_METHODS_AVAILABLE = False
@@ -27,7 +51,7 @@ CORS(app)
 # Giphy API configuration
 # API Key is optional - if not provided, we'll use web scraping as fallback
 # Get your API key from: https://developers.giphy.com/
-GIPHY_API_KEY = os.environ.get('GIPHY_API_KEY', 'L8eXbxrbPETZxlvgXN9kIEzQ55Df04v0')  # Your API key
+GIPHY_API_KEY = os.environ.get('GIPHY_API_KEY', '')
 GIPHY_API_BASE = 'https://api.giphy.com/v1'
 USE_API = os.environ.get('USE_GIPHY_API', 'true').lower() == 'true'
 
@@ -133,6 +157,14 @@ PROXY_CONFIGS = {
 # Alternative: Use VPN services or proxy rotation services
 # You can also use services like Bright Data, Oxylabs, etc.
 
+# Set VERBOSE_LOGS=true in .env to see detailed per-GIF detection output
+VERBOSE_LOGS = os.environ.get('VERBOSE_LOGS', 'false').lower() == 'true'
+
+def _log(msg):
+    """Only print if verbose logging enabled."""
+    if VERBOSE_LOGS:
+        _orig_print(msg)
+
 # Request timeout and delay settings for channel status detection
 REQUEST_TIMEOUT = 30
 REQUEST_DELAY = 0.3  # Reduced delay between API requests in seconds (optimized for speed)
@@ -195,16 +227,18 @@ def fetch_channel_info(channel_username: str) -> dict:
         limit = 50  # Maximum per request
         max_pages = 20  # Fetch up to 1000 GIFs
         
-        print(f"Fetching GIFs for channel: {channel_username}")
+        _log(f"Fetching GIFs for channel: {channel_username}")
         
         # Try different case variants (API usernames are case-sensitive)
         # e.g., "bloomscroll" URL might need "Bloomscroll" in API
         # e.g., "vibleai" URL might need "vibleAI" in API
         # e.g., "GifStudios_" URL has underscore as part of username
         username_variants = [
-            channel_username,  # Try as-is first
-            channel_username.capitalize(),  # Try capitalized (e.g., "bloomscroll" -> "Bloomscroll")
-            channel_username.title(),  # Try title case
+            channel_username,              # as-is from URL slug
+            channel_username.lower(),      # all lowercase (e.g. DPAKWorld -> dpakworld)
+            channel_username.upper(),      # all uppercase
+            channel_username.capitalize(), # first letter only (e.g. brockonsol -> Brockonsol)
+            channel_username.title(),      # title case (e.g. brock-on-sol -> Brock-On-Sol)
         ]
         
         # Handle trailing underscores - generate variants with and without
@@ -252,7 +286,7 @@ def fetch_channel_info(channel_username: str) -> dict:
         
         # Remove duplicates while preserving order
         username_variants = list(dict.fromkeys(username_variants))
-        print(f"  Trying {len(username_variants)} username variants: {username_variants[:5]}...")
+        _log(f"  Trying {len(username_variants)} username variants: {username_variants[:5]}...")
         
         username_found = None
         for username_variant in username_variants:
@@ -307,12 +341,12 @@ def fetch_channel_info(channel_username: str) -> dict:
                         gif_username in [v.lower() for v in username_variants]):
                         verified_gifs.append(gif)
                     else:
-                        print(f"    ⚠️  Skipping GIF {gif.get('id', 'unknown')} - username mismatch: {gif_username} != {channel_username_lower}")
+                        _log(f"    ⚠️  Skipping GIF {gif.get('id', 'unknown')} - username mismatch: {gif_username} != {channel_username_lower}")
                 
                 if len(verified_gifs) > 0:
                     username_found = username_variant
                     all_gifs = verified_gifs
-                    print(f"  Found {len(all_gifs)} verified GIFs with username: {username_variant}")
+                    _log(f"  Found {len(all_gifs)} verified GIFs with username: {username_variant}")
                     
                     # Extract user info from first GIF if available
                     if not result['user_data']:
@@ -322,15 +356,15 @@ def fetch_channel_info(channel_username: str) -> dict:
                             result['user_data'] = user_from_gif
                             # Use the actual username from API response
                             actual_username = user_from_gif.get('username', username_variant)
-                            print(f"[OK] Channel exists: Found {len(all_gifs)} GIFs (username: {actual_username})")
+                            _log(f"[OK] Channel exists: Found {len(all_gifs)} GIFs (username: {actual_username})")
                     break  # Found GIFs, no need to try other variants
                 else:
-                    print(f"  ⚠️  Found GIFs but none verified as belonging to channel '{channel_username}'")
+                    _log(f"  ⚠️  Found GIFs but none verified as belonging to channel '{channel_username}'")
                     # Continue to next variant
         
         # Method 2: Try direct user endpoint with all username variants to get actual username
         if len(all_gifs) == 0:
-            print(f"  Username parameter didn't work, trying direct user endpoint...")
+            _log(f"  Username parameter didn't work, trying direct user endpoint...")
             actual_username_from_api = None
             for username_variant in username_variants:
                 try:
@@ -343,14 +377,14 @@ def fetch_channel_info(channel_username: str) -> dict:
                         if user_data:
                             result['user_data'] = user_data
                             actual_username_from_api = user_data.get('username', username_variant)
-                            print(f"  Found user via endpoint: {actual_username_from_api}")
+                            _log(f"  Found user via endpoint: {actual_username_from_api}")
                             break
                 except:
                     pass
             
             # If we found the actual username, retry fetching GIFs with it
             if actual_username_from_api and actual_username_from_api not in username_variants:
-                print(f"  Retrying GIF fetch with actual username: {actual_username_from_api}")
+                _log(f"  Retrying GIF fetch with actual username: {actual_username_from_api}")
                 offset = 0
                 retry_gifs = []
                 for page in range(max_pages):
@@ -388,15 +422,15 @@ def fetch_channel_info(channel_username: str) -> dict:
                 if len(retry_gifs) > 0:
                     all_gifs = retry_gifs
                     result['exists'] = True
-                    print(f"  Found {len(all_gifs)} verified GIFs with actual username: {actual_username_from_api}")
+                    _log(f"  Found {len(all_gifs)} verified GIFs with actual username: {actual_username_from_api}")
                     # user_data is already set in result['user_data'] above
                 else:
-                    print(f"  ⚠️  No verified GIFs found with actual username: {actual_username_from_api}")
+                    _log(f"  ⚠️  No verified GIFs found with actual username: {actual_username_from_api}")
         
         # Method 3: If username parameter didn't work, try searching by channel name
         # and filter results by username
         if len(all_gifs) == 0:
-            print(f"  Direct user endpoint didn't work, trying search query method...")
+            _log(f"  Direct user endpoint didn't work, trying search query method...")
             offset = 0
             
             for page in range(max_pages):
@@ -460,11 +494,11 @@ def fetch_channel_info(channel_username: str) -> dict:
                         if matches:
                             filtered_gifs.append(gif)
                             # Debug: print matched GIF to verify
-                            print(f"    ✓ Matched GIF {gif.get('id', 'unknown')} from user: {gif_username}")
+                            _log(f"    ✓ Matched GIF {gif.get('id', 'unknown')} from user: {gif_username}")
                     
                     if len(filtered_gifs) > 0:
                         all_gifs.extend(filtered_gifs)
-                        print(f"  Fetched {len(filtered_gifs)} GIFs from search (total: {len(all_gifs)})")
+                        _log(f"  Fetched {len(filtered_gifs)} GIFs from search (total: {len(all_gifs)})")
                         result['exists'] = True
                         
                         # Extract user info from first GIF if available
@@ -474,12 +508,12 @@ def fetch_channel_info(channel_username: str) -> dict:
                             if user_from_gif:
                                 result['user_data'] = user_from_gif
                                 actual_username = user_from_gif.get('username', '')
-                                print(f"  Confirmed channel username from GIFs: {actual_username}")
+                                _log(f"  Confirmed channel username from GIFs: {actual_username}")
                     elif offset == 0:
                         # No matching GIFs found even in first page
                         # This means search query found GIFs but none belong to this channel
-                        print(f"  ⚠️  Search found GIFs but none belong to channel '{channel_username}'")
-                        print(f"     This likely means the channel is BANNED (no GIFs accessible via API)")
+                        _log(f"  ⚠️  Search found GIFs but none belong to channel '{channel_username}'")
+                        _log(f"     This likely means the channel is BANNED (no GIFs accessible via API)")
                         break
                     
                     # If we got fewer than limit, we've reached the end
@@ -501,7 +535,7 @@ def fetch_channel_info(channel_username: str) -> dict:
                 if user_response.status_code == 200:
                     user_data = user_response.json().get('data', {})
                     result['user_data'] = user_data
-                    print(f"[OK] User info found: {user_data.get('display_name', channel_username)}")
+                    _log(f"[OK] User info found: {user_data.get('display_name', channel_username)}")
             except:
                 pass  # User endpoint not available, but we have GIFs so channel exists
         
@@ -511,8 +545,8 @@ def fetch_channel_info(channel_username: str) -> dict:
             result['exists'] = False
             result['total_gifs'] = 0
             result['total_views'] = 0
-            print(f"[X] Channel not found or BANNED: {channel_username}")
-            print(f"    No GIFs accessible via API - channel is likely BANNED")
+            _log(f"[X] Channel not found or BANNED: {channel_username}")
+            _log(f"    No GIFs accessible via API - channel is likely BANNED")
             return result
         
         # Verify that we actually found GIFs from the correct channel
@@ -525,24 +559,24 @@ def fetch_channel_info(channel_username: str) -> dict:
             for gif in all_gifs:
                 gif_user = gif.get('user', {})
                 gif_username = gif_user.get('username', '').lower() if gif_user.get('username') else ''
-                
-                # Verify this GIF belongs to the channel
-                if (gif_username == channel_username_lower or 
-                    gif_username in username_variants_lower):
+
+                # Case-insensitive match against channel slug or any variant
+                if gif_username and (gif_username == channel_username_lower or
+                                     gif_username in username_variants_lower):
                     verified_gifs.append(gif)
                 else:
-                    print(f"    ⚠️  Skipping GIF {gif.get('id', 'unknown')} - username mismatch: {gif_username} != {channel_username_lower}")
+                    _log(f"    ⚠️  Skipping GIF {gif.get('id', 'unknown')} - username mismatch: {gif_username} != {channel_username_lower}")
             
             # If we lost GIFs during verification, update the list
             if len(verified_gifs) < len(all_gifs):
-                print(f"  ⚠️  Verification: {len(verified_gifs)}/{len(all_gifs)} GIFs verified as belonging to channel")
+                _log(f"  ⚠️  Verification: {len(verified_gifs)}/{len(all_gifs)} GIFs verified as belonging to channel")
                 if len(verified_gifs) == 0:
                     # No verified GIFs - channel is likely BANNED
                     result['exists'] = False
                     result['error'] = 'No GIFs found that belong to this channel (likely BANNED)'
                     result['total_gifs'] = 0
                     result['total_views'] = 0
-                    print(f"[X] No verified GIFs - channel is BANNED")
+                    _log(f"[X] No verified GIFs - channel is BANNED")
                     return result
                 all_gifs = verified_gifs
         
@@ -560,16 +594,34 @@ def fetch_channel_info(channel_username: str) -> dict:
         
         result['total_views'] = total_views
         
-        print(f"[OK] Total GIFs: {result['total_gifs']}, Total Views: {result['total_views']}")
+        # print(f"[OK] Total GIFs: {result['total_gifs']}, Total Views: {result['total_views']}")
         
     except requests.exceptions.RequestException as e:
         result['error'] = f'Request error: {str(e)}'
-        print(f"[X] Request error: {str(e)}")
+        _log(f"[X] Request error: {str(e)}")
     except Exception as e:
         result['error'] = f'Unexpected error: {str(e)}'
-        print(f"[X] Unexpected error: {str(e)}")
+        _log(f"[X] Unexpected error: {str(e)}")
     
     return result
+
+
+def _check_giphy_page_accessible(channel_username: str) -> bool:
+    """Check if the Giphy channel page is a real active channel.
+    Giphy returns 200 for all URLs (even banned/missing), so we check for
+    'uploads' in the page body — only present on real channel pages."""
+    urls_to_try = [
+        f"https://giphy.com/{channel_username}",
+        f"https://giphy.com/channel/{channel_username}",
+    ]
+    for url in urls_to_try:
+        try:
+            r = _requests_session.get(url, timeout=12, allow_redirects=True)
+            if r.status_code == 200 and 'uploads' in r.text.lower():
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def check_banned_channel(channel_username: str) -> dict:
@@ -598,9 +650,9 @@ def check_banned_channel(channel_username: str) -> dict:
         'channel_info': None
     }
     
-    print(f"\n{'='*60}")
-    print(f"Checking BANNED status for: {channel_username}")
-    print(f"{'='*60}")
+    _log(f"\n{'='*60}")
+    _log(f"Checking BANNED status for: {channel_username}")
+    _log(f"{'='*60}")
     
     # Fetch channel info from GIPHY API
     channel_info = fetch_channel_info(channel_username)
@@ -610,33 +662,25 @@ def check_banned_channel(channel_username: str) -> dict:
     total_gifs = channel_info.get('total_gifs', 0)
     total_views = channel_info.get('total_views', 0)
     
-    # BANNED: Channel not found in API (no GIFs accessible)
-    if not channel_info.get('exists'):
-        result['is_banned'] = True
-        result['reason'] = 'Channel not found in GIPHY API - no GIFs or views accessible'
-        # Ensure values are 0 for banned channels
-        channel_info['total_gifs'] = 0
-        channel_info['total_views'] = 0
-        print(f"[X] BANNED: Channel not found - total_gifs: 0, total_views: 0")
-        return result
-    
-    # BANNED: Channel exists but has no GIFs (API returned no GIFs)
-    if total_gifs == 0:
-        result['is_banned'] = True
-        result['reason'] = 'Channel exists but API returned no GIFs (banned)'
-        # Ensure values are 0 for banned channels
-        channel_info['total_gifs'] = 0
-        channel_info['total_views'] = 0
-        print(f"[X] BANNED: Channel has no GIFs - total_gifs: 0, total_views: 0")
-        return result
-    
-    # BANNED: Channel has GIFs but no views (unusual, but could indicate ban)
-    # Only mark as banned if both are 0
-    if total_gifs == 0 and total_views == 0:
-        result['is_banned'] = True
-        result['reason'] = 'Channel has no GIFs and no views (banned)'
-        print(f"[X] BANNED: No GIFs and no views - total_gifs: 0, total_views: 0")
-        return result
+    # API found no GIFs — could be: (1) truly banned/deleted, (2) username case mismatch
+    # Verify by checking if the Giphy channel page is publicly accessible before declaring banned
+    if not channel_info.get('exists') or total_gifs == 0:
+        page_accessible = _check_giphy_page_accessible(channel_username)
+        if page_accessible:
+            # Page is live — not banned. Username case mismatch prevented API fetch.
+            result['is_banned'] = False
+            result['reason'] = 'Channel page accessible (username case mismatch with API)'
+            channel_info['total_gifs'] = 0
+            channel_info['total_views'] = 0
+            _log(f"[?] 0 GIFs via API but page accessible — not banned (username case mismatch)")
+            return result
+        else:
+            result['is_banned'] = True
+            result['reason'] = 'Channel not found via API or web — banned or deleted'
+            channel_info['total_gifs'] = 0
+            channel_info['total_views'] = 0
+            _log(f"[X] BANNED: 0 GIFs from API and page not accessible")
+            return result
     
     # Check if there's an error that might indicate a ban
     if channel_info.get('error'):
@@ -647,12 +691,12 @@ def check_banned_channel(channel_username: str) -> dict:
             # Ensure values are 0 for banned channels
             channel_info['total_gifs'] = 0
             channel_info['total_views'] = 0
-            print(f"[X] BANNED: {result['reason']} - total_gifs: 0, total_views: 0")
+            _log(f"[X] BANNED: {result['reason']} - total_gifs: 0, total_views: 0")
             return result
     
     # If we got here, channel exists and has GIFs/views - NOT BANNED
     # Continue to check for shadow banned or working status
-    print(f"[OK] NOT BANNED: Channel exists with {total_gifs} GIFs and {total_views:,} views")
+    _log(f"[OK] NOT BANNED: Channel exists with {total_gifs} GIFs and {total_views:,} views")
     result['is_banned'] = False
     result['reason'] = 'Channel exists and has content accessible via API'
     
@@ -701,7 +745,7 @@ def get_gif_tags(gif_id: str) -> list:
         else:
             return []
     except Exception as e:
-        print(f"  Error fetching tags for GIF {gif_id}: {str(e)}")
+        _log(f"  Error fetching tags for GIF {gif_id}: {str(e)}")
         return []
 
 
@@ -757,14 +801,25 @@ def get_gif_tags_batch(gif_ids: list, channel_username: str = None) -> dict:
             return None
     
     # Fetch tags in parallel (up to 15 at a time for speed - optimized)
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        futures = {executor.submit(fetch_tags_for_gif, gif_id): gif_id for gif_id in gif_ids}
-        
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                gif_id, tags = result
-                tags_dict[gif_id] = tags
+    try:
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            futures = {executor.submit(fetch_tags_for_gif, gif_id): gif_id for gif_id in gif_ids}
+            
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    gif_id, tags = result
+                    tags_dict[gif_id] = tags
+    except RuntimeError as e:
+        # Fallback: if interpreter is shutting down or executor can't schedule,
+        # perform sequential fetch to avoid raising further errors.
+        err_msg = str(e)
+        print(f"Warning: ThreadPool failed ({err_msg}), falling back to sequential fetch")
+        for gif_id in gif_ids:
+            res = fetch_tags_for_gif(gif_id)
+            if res:
+                gid, tags = res
+                tags_dict[gid] = tags
     
     return tags_dict
 
@@ -887,7 +942,7 @@ def check_channel_gifs_in_search_results(search_query: str, channel_username: st
         return False
         
     except Exception as e:
-        print(f"  Error checking search results for channel '{channel_username}' with query '{search_query}': {str(e)}")
+        _log(f"  Error checking search results for channel '{channel_username}' with query '{search_query}': {str(e)}")
         return False
 
 
@@ -1000,7 +1055,7 @@ def check_gif_in_search_results(gif_id: str, search_query: str, max_results: int
         return False
         
     except Exception as e:
-        print(f"  Error checking search results for GIF {gif_id} with query '{search_query}': {str(e)}")
+        _log(f"  Error checking search results for GIF {gif_id} with query '{search_query}': {str(e)}")
         return False
 
 
@@ -1025,7 +1080,7 @@ def _check_single_gif_visibility(gif_data: tuple, tags_dict: dict = None, channe
     gif_id = gif.get('id')
     gif_title = gif.get('title', '')
     
-    print(f"\n  [{i}/{total}] Checking GIF: {gif_id}")
+    _log(f"\n  [{i}/{total}] Checking GIF: {gif_id}")
     
     # Get tags - use pre-fetched if available, otherwise fetch now
     if tags_dict and gif_id in tags_dict:
@@ -1041,7 +1096,7 @@ def _check_single_gif_visibility(gif_data: tuple, tags_dict: dict = None, channe
             tags = []
     
     if not tags:
-        print(f"    [WARN] No tags or title available, skipping")
+        _log(f"    [WARN] No tags or title available, skipping")
         return {
             'gif_id': gif_id,
             'found': False,
@@ -1049,7 +1104,7 @@ def _check_single_gif_visibility(gif_data: tuple, tags_dict: dict = None, channe
             'checked_tags': []
         }
     
-    print(f"    Found {len(tags)} tag(s): {', '.join(tags[:10])}{'...' if len(tags) > 10 else ''}")
+    _log(f"    Found {len(tags)} tag(s): {', '.join(tags[:10])}{'...' if len(tags) > 10 else ''}")
     
     # Check if GIF appears in search results for tags
     # Check more tags (up to 10) and search deeper (2500 results) to properly detect visibility
@@ -1069,22 +1124,22 @@ def _check_single_gif_visibility(gif_data: tuple, tags_dict: dict = None, channe
             found = check_channel_gifs_in_search_results(tag, channel_username, max_results=2500)
             
             if found:
-                print(f"    [OK] Channel GIF found in search for tag: '{tag}' (relevant sort)")
+                _log(f"    [OK] Channel GIF found in search for tag: '{tag}' (relevant sort)")
             else:
                 # Debug: The channel GIFs might be there but we're not matching correctly
                 # This could happen if:
                 # 1. Channel username format is different in search results
                 # 2. Search is not returning channel GIFs (shadow banned)
                 # 3. Channel GIFs are beyond 2500 results
-                print(f"    [X] No channel GIFs found in search for tag: '{tag}' (relevant sort)")
+                _log(f"    [X] No channel GIFs found in search for tag: '{tag}' (relevant sort)")
         else:
             # Fallback: Check if the specific GIF appears (if no channel username provided)
             found = check_gif_in_search_results(gif_id, tag, max_results=2500, channel_username=channel_username)
             
             if found:
-                print(f"    [OK] Found in search for tag: '{tag}' (relevant sort)")
+                _log(f"    [OK] Found in search for tag: '{tag}' (relevant sort)")
             else:
-                print(f"    [X] Not found in search for tag: '{tag}' (relevant sort)")
+                _log(f"    [X] Not found in search for tag: '{tag}' (relevant sort)")
         
         return {
             'tag': tag, 
@@ -1127,7 +1182,7 @@ def _check_single_gif_visibility(gif_data: tuple, tags_dict: dict = None, channe
                     'skipped': True
                 })
             except Exception as e:
-                print(f"    [ERROR] Error checking tag '{tag}': {str(e)}")
+                _log(f"    [ERROR] Error checking tag '{tag}': {str(e)}")
                 checked_tags.append({
                     'tag': tag,
                     'found': False,
@@ -1181,9 +1236,9 @@ def check_shadow_banned_channel(channel_username: str, channel_gifs: list = None
         'details': []
     }
     
-    print(f"\n{'='*60}")
-    print(f"Checking SHADOW BANNED status for: {channel_username}")
-    print(f"{'='*60}")
+    _log(f"\n{'='*60}")
+    _log(f"Checking SHADOW BANNED status for: {channel_username}")
+    _log(f"{'='*60}")
     
     # Fetch GIFs if not provided
     if channel_gifs is None:
@@ -1201,16 +1256,16 @@ def check_shadow_banned_channel(channel_username: str, channel_gifs: list = None
     if len(sample_gifs) == 0:
         result['is_shadow_banned'] = True
         result['reason'] = 'No GIFs to check'
-        print(f"[X] SHADOW BANNED: No GIFs available to check")
+        _log(f"[X] SHADOW BANNED: No GIFs available to check")
         return result
     
-    print(f"Checking {len(sample_gifs)} GIFs for search visibility...")
+    _log(f"Checking {len(sample_gifs)} GIFs for search visibility...")
     
     # Step 1: Fetch all tags in parallel for speed
-    print(f"  Fetching tags for {len(sample_gifs)} GIFs in parallel...")
+    _log(f"  Fetching tags for {len(sample_gifs)} GIFs in parallel...")
     gif_ids = [gif.get('id') for gif in sample_gifs if gif.get('id')]
     tags_dict = get_gif_tags_batch(gif_ids, channel_username)
-    print(f"  ✓ Fetched tags for {len(tags_dict)} GIFs")
+    _log(f"  ✓ Fetched tags for {len(tags_dict)} GIFs")
     
     # Step 2: Process GIFs in parallel (up to 8 at a time) with pre-fetched tags - optimized
     gif_data_list = [(i+1, len(sample_gifs), gif) for i, gif in enumerate(sample_gifs)]
@@ -1236,7 +1291,7 @@ def check_shadow_banned_channel(channel_username: str, channel_gifs: list = None
                 gif_data = gif_futures.get(future, (0, 0, {}))
                 index = gif_data[0] - 1 if len(gif_data) > 0 else 0
                 gif_id = gif_data[2].get('id', 'unknown') if len(gif_data) > 2 else 'unknown'
-                print(f"    [ERROR] Failed to check GIF {gif_id}: {str(e)}")
+                _log(f"    [ERROR] Failed to check GIF {gif_id}: {str(e)}")
                 gif_results_dict[index] = {
                     'gif_id': gif_id,
                     'found': False,
@@ -1255,11 +1310,11 @@ def check_shadow_banned_channel(channel_username: str, channel_gifs: list = None
     if visibility_rate < 30:
         result['is_shadow_banned'] = True
         result['reason'] = f'Only {visibility_rate:.1f}% of GIFs visible in search'
-        print(f"\n[X] SHADOW BANNED: Only {result['gifs_found_in_search']}/{result['gifs_checked']} GIFs found in search ({visibility_rate:.1f}%)")
+        _log(f"\n[X] SHADOW BANNED: Only {result['gifs_found_in_search']}/{result['gifs_checked']} GIFs found in search ({visibility_rate:.1f}%)")
     else:
         result['is_shadow_banned'] = False
         result['reason'] = f'{visibility_rate:.1f}% of GIFs visible in search'
-        print(f"\n[OK] NOT SHADOW BANNED: {result['gifs_found_in_search']}/{result['gifs_checked']} GIFs found in search ({visibility_rate:.1f}%)")
+        _log(f"\n[OK] NOT SHADOW BANNED: {result['gifs_found_in_search']}/{result['gifs_checked']} GIFs found in search ({visibility_rate:.1f}%)")
     
     return result
 
@@ -1295,9 +1350,9 @@ def check_working_channel(channel_username: str, channel_gifs: list = None) -> d
         'details': {}
     }
     
-    print(f"\n{'='*60}")
-    print(f"Checking WORKING status for: {channel_username}")
-    print(f"{'='*60}")
+    _log(f"\n{'='*60}")
+    _log(f"Checking WORKING status for: {channel_username}")
+    _log(f"{'='*60}")
     
     # Step 1: Check if banned
     banned_result = check_banned_channel(channel_username)
@@ -1306,7 +1361,7 @@ def check_working_channel(channel_username: str, channel_gifs: list = None) -> d
     if banned_result.get('is_banned'):
         result['is_working'] = False
         result['reason'] = 'Channel is banned'
-        print(f"[X] NOT WORKING: Channel is banned")
+        _log(f"[X] NOT WORKING: Channel is banned")
         return result
     
     # Step 2: Check if shadow banned (this will also verify GIFs in search)
@@ -1320,7 +1375,7 @@ def check_working_channel(channel_username: str, channel_gifs: list = None) -> d
     if shadow_banned_result.get('is_shadow_banned'):
         result['is_working'] = False
         result['reason'] = 'Channel is shadow banned'
-        print(f"[X] NOT WORKING: Channel is shadow banned")
+        _log(f"[X] NOT WORKING: Channel is shadow banned")
         return result
     
     # Step 3: If not banned and not shadow banned, channel is working
@@ -1334,7 +1389,7 @@ def check_working_channel(channel_username: str, channel_gifs: list = None) -> d
         result['visibility_rate'] = 0.0
     
     result['reason'] = f'Channel is working - {result["gifs_found_in_search"]}/{result["total_gifs_checked"]} GIFs visible in search'
-    print(f"[OK] WORKING: Channel is active and {result['gifs_found_in_search']}/{result['total_gifs_checked']} GIFs are visible in search ({result['visibility_rate']:.1f}%)")
+    _log(f"[OK] WORKING: Channel is active and {result['gifs_found_in_search']}/{result['total_gifs_checked']} GIFs are visible in search ({result['visibility_rate']:.1f}%)")
     
     return result
 
@@ -1374,11 +1429,7 @@ def detect_channel_status(channel_input: str) -> dict:
             }
         }
     
-    print(f"\n{'='*70}")
-    print(f"CHANNEL STATUS DETECTION")
-    print(f"Input: {channel_input}")
-    print(f"Channel: {channel_username}")
-    print(f"{'='*70}\n")
+    print(f"  ⏳ Checking: {channel_username}")
     
     result = {
         'channel_username': channel_username,
@@ -1410,7 +1461,7 @@ def detect_channel_status(channel_input: str) -> dict:
             if channel_info:
                 channel_info['total_gifs'] = 0
                 channel_info['total_views'] = 0
-            print(f"[BANNED] Total GIFs: 0, Total Views: 0 (not accessible from API)")
+            # print(f"[BANNED] Total GIFs: 0, Total Views: 0 (not accessible from API)")
             return result
         
         # Step 2: Get channel info for shadow banned check
@@ -1420,13 +1471,23 @@ def detect_channel_status(channel_input: str) -> dict:
         total_gifs = channel_info.get('total_gifs', 0)
         total_views = channel_info.get('total_views', 0)
         
-        # Ensure we have valid data (not banned)
-        if total_gifs == 0 and total_views == 0:
-            # This shouldn't happen if not banned, but double-check
+        # If banned_result says not_banned but we have 0 GIFs (username case mismatch case),
+        # mark as shadow_banned since channel exists but we can't verify via API
+        if total_gifs == 0:
+            ban_reason = banned_result.get('reason', '')
+            if 'case mismatch' in ban_reason or 'accessible' in ban_reason:
+                result['status'] = 'shadow_banned'
+                result['summary'] = {
+                    'status': 'SHADOW BANNED',
+                    'reason': 'Channel visible on Giphy but GIFs not accessible via API (likely shadow banned)',
+                    'total_gifs': 0,
+                    'total_views': 0
+                }
+                return result
             result['status'] = 'banned'
             result['summary'] = {
                 'status': 'BANNED',
-                'reason': 'No GIFs or views accessible from API',
+                'reason': 'No GIFs accessible from API',
                 'total_gifs': 0,
                 'total_views': 0
             }
@@ -1448,7 +1509,7 @@ def detect_channel_status(channel_input: str) -> dict:
                 'gifs_checked': shadow_banned_result.get('gifs_checked', 0),
                 'gifs_found_in_search': shadow_banned_result.get('gifs_found_in_search', 0)
             }
-            print(f"[SHADOW BANNED] Total GIFs: {total_gifs}, Total Views: {total_views:,} (visible in API but not in search)")
+            # print(f"[SHADOW BANNED] Total GIFs: {total_gifs}, Total Views: {total_views:,} (visible in API but not in search)")
             return result
         
         # Step 4: Check if working (not banned and not shadow banned)
@@ -1466,7 +1527,7 @@ def detect_channel_status(channel_input: str) -> dict:
                 'gifs_found_in_search': working_result.get('gifs_found_in_search', 0),
                 'visibility_rate': working_result.get('visibility_rate', 0.0)
             }
-            print(f"[WORKING] Total GIFs: {total_gifs}, Total Views: {total_views:,} (visible in API and in search)")
+            # print(f"[WORKING] Total GIFs: {total_gifs}, Total Views: {total_views:,} (visible in API and in search)")
         else:
             result['status'] = 'unknown'
             result['summary'] = {
@@ -1486,23 +1547,16 @@ def detect_channel_status(channel_input: str) -> dict:
             'status': 'ERROR',
             'reason': f'Error during detection: {error_msg}'
         }
-        print(f"[X] Error during detection: {error_msg}")
-        print(f"[X] Traceback: {error_trace}")
+        _log(f"[X] Error during detection: {error_msg}")
+        _log(f"[X] Traceback: {error_trace}")
     
-    # Print final summary
-    print(f"\n{'='*70}")
-    print(f"FINAL STATUS: {result['summary'].get('status', 'UNKNOWN')}")
-    print(f"{'='*70}")
-    print(f"Channel: {channel_username}")
-    print(f"Status: {result['status']}")
-    if result['summary'].get('total_gifs') is not None:
-        print(f"Total GIFs: {result['summary'].get('total_gifs', 0)}")
-    if result['summary'].get('total_views') is not None:
-        print(f"Total Views: {result['summary'].get('total_views', 0)}")
-    if result['summary'].get('visibility_rate') is not None:
-        print(f"Visibility Rate: {result['summary'].get('visibility_rate', 0):.1f}%")
-    print(f"Reason: {result['summary'].get('reason', 'N/A')}")
-    print(f"{'='*70}\n")
+    # Clean single-line status log
+    status_label = result['summary'].get('status', 'UNKNOWN')
+    gifs = result['summary'].get('total_gifs', 0)
+    reason = result['summary'].get('reason', '')
+    icons = {'WORKING': '✅', 'SHADOW BANNED': '👻', 'BANNED': '🚫', 'ERROR': '⚠️', 'UNKNOWN': '❓'}
+    icon = icons.get(status_label, '❓')
+    print(f"  {icon} [{status_label:12}] {channel_username:<35} GIFs:{gifs:>5}  {reason[:60]}")
     
     return result
 
@@ -1591,6 +1645,335 @@ def extract_channel_username_from_url(url: str):
     
     return None
 
+NOTION_API_KEY = os.environ.get('NOTION_API_KEY', '')
+NOTION_DATABASE_ID = os.environ.get('NOTION_DATABASE_ID', '')
+NOTION_URL_PROPERTY_NAME = os.environ.get('NOTION_URL_PROPERTY_NAME', 'Giphy URL')
+NOTION_STATUS_PROPERTY_NAME = os.environ.get('NOTION_STATUS_PROPERTY_NAME', 'Giphy Verification')
+NOTION_ALLOWED_STATUSES = [s.strip() for s in os.environ.get('NOTION_ALLOWED_STATUSES', 'Verified,Declined').split(',') if s.strip()]
+NOTION_API_VERSION = os.environ.get('NOTION_API_VERSION', '2022-06-28')
+SCHEDULED_CHECK_INTERVAL_SECONDS = int(os.environ.get('SCHEDULED_CHECK_INTERVAL_SECONDS', 12 * 60 * 60))
+SCHEDULED_CHANNEL_URLS = [url.strip() for url in os.environ.get('SCHEDULED_CHANNEL_URLS', '').splitlines() if url.strip()]
+
+scheduled_results = {
+    'last_run': None,
+    'status': 'idle',
+    'channels': [],
+    'error': None,
+    'next_run': None
+}
+scheduled_results_lock = threading.Lock()
+
+# Prevent duplicate scheduler threads in Flask reloader
+scheduler_thread_started = False
+scheduler_thread = None
+
+
+def _extract_notion_url_property(property_data):
+    if not property_data:
+        return None
+    prop_type = property_data.get('type')
+    if prop_type == 'url':
+        return property_data.get('url')
+    if prop_type in ('rich_text', 'title'):
+        text_items = property_data.get(prop_type, [])
+        return ''.join(item.get('plain_text', '') for item in text_items).strip()
+    if prop_type == 'phone_number':
+        return property_data.get('phone_number')
+    if prop_type == 'email':
+        return property_data.get('email')
+    if prop_type == 'text':
+        return ''.join(item.get('plain_text', '') for item in property_data.get('text', [])).strip()
+    return None
+
+
+def _extract_notion_urls_from_properties(properties: dict, target_property_name: str = None) -> list:
+    urls = []
+    if target_property_name and target_property_name in properties:
+        value = _extract_notion_url_property(properties[target_property_name])
+        if value and value.strip():
+            urls.append(value.strip())
+
+    if not urls:
+        for prop_name, prop_value in properties.items():
+            value = _extract_notion_url_property(prop_value)
+            if value and 'giphy.com' in value.lower():
+                urls.append(value.strip())
+
+    return urls
+    
+
+
+def _extract_notion_status_property(property_data):
+    if not property_data:
+        return None
+    prop_type = property_data.get('type')
+    if prop_type == 'select':
+        selected = property_data.get('select') or {}
+        return selected.get('name')
+    if prop_type == 'multi_select':
+        selected = property_data.get('multi_select', [])
+        return ','.join(item.get('name', '') for item in selected if item.get('name'))
+    if prop_type == 'status':
+        status = property_data.get('status') or {}
+        return status.get('name')
+    if prop_type in ('rich_text', 'title'):
+        text_items = property_data.get(prop_type, [])
+        return ''.join(item.get('plain_text', '') for item in text_items).strip()
+    if prop_type == 'text':
+        return ''.join(item.get('plain_text', '') for item in property_data.get('text', [])).strip()
+    return None
+
+
+def _page_status_is_allowed(properties: dict) -> bool:
+    if not properties or NOTION_STATUS_PROPERTY_NAME not in properties:
+        return True
+
+    status_value = _extract_notion_status_property(properties.get(NOTION_STATUS_PROPERTY_NAME))
+    if not status_value:
+        return True
+
+    return status_value.strip() in NOTION_ALLOWED_STATUSES
+
+
+def get_notion_channel_urls(notion_api_key: str, database_id: str, url_property_name: str = 'Giphy URL') -> list:
+    """Fetch channel URLs from a Notion database property."""
+    if not Client:
+        raise RuntimeError('Missing notion-client package. Install with: pip install notion-client')
+    if not notion_api_key:
+        raise ValueError('Notion API key is required')
+    if not database_id:
+        raise ValueError('Notion database ID is required')
+
+    notion = Client(auth=notion_api_key)
+    urls = []
+    start_cursor = None
+
+    if hasattr(notion.databases, 'query'):
+        while True:
+            response = notion.databases.query(
+                database_id=database_id,
+                start_cursor=start_cursor,
+                page_size=100
+            )
+
+            for page in response.get('results', []):
+                properties = page.get('properties', {})
+
+                if not _page_status_is_allowed(properties):
+                    continue
+
+                page_urls = _extract_notion_urls_from_properties(properties, url_property_name)
+                urls.extend(page_urls)
+
+            if not response.get('has_more'):
+                break
+            start_cursor = response.get('next_cursor')
+    else:
+        headers = {
+            'Authorization': f'Bearer {notion_api_key}',
+            'Notion-Version': NOTION_API_VERSION,
+            'Content-Type': 'application/json'
+        }
+        query_url = f'https://api.notion.com/v1/databases/{database_id}/query'
+
+        while True:
+            payload = {
+                'page_size': 100
+            }
+            if start_cursor:
+                payload['start_cursor'] = start_cursor
+
+            response = requests.post(query_url, headers=headers, json=payload, timeout=30)
+            if response.status_code != 200:
+                raise RuntimeError(f'Notion API error: {response.status_code} {response.text}')
+
+            response_json = response.json()
+            for page in response_json.get('results', []):
+                properties = page.get('properties', {})
+
+                if not _page_status_is_allowed(properties):
+                    continue
+
+                page_urls = _extract_notion_urls_from_properties(properties, url_property_name)
+                urls.extend(page_urls)
+
+            if not response_json.get('has_more'):
+                break
+            start_cursor = response_json.get('next_cursor')
+
+    urls = list(dict.fromkeys(urls))
+    if len(urls) == 0:
+        raise ValueError(f'No channel URLs found in Notion database {database_id} property "{url_property_name}"')
+
+    return urls
+
+
+def get_notion_channels_with_metadata() -> list:
+    """Fetch channels from Notion DB with name, URL, and verification status.
+    Returns only Verified and Declined entries."""
+    if not NOTION_API_KEY or not NOTION_DATABASE_ID:
+        return []
+
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Notion-Version': NOTION_API_VERSION,
+        'Content-Type': 'application/json'
+    }
+    query_url = f'https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query'
+    channels = []
+    cursor = None
+
+    while True:
+        payload = {'page_size': 100}
+        if cursor:
+            payload['start_cursor'] = cursor
+
+        response = requests.post(query_url, headers=headers, json=payload, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError(f'Notion API error: {response.status_code} {response.text}')
+
+        data = response.json()
+        for page in data.get('results', []):
+            properties = page.get('properties', {})
+
+            # Extract verification status
+            verif_prop = properties.get(NOTION_STATUS_PROPERTY_NAME, {})
+            verif_status = _extract_notion_status_property(verif_prop) or ''
+
+            # Only include Verified and Declined
+            if verif_status.strip() not in NOTION_ALLOWED_STATUSES:
+                continue
+
+            # Extract channel name
+            name_prop = properties.get('Name', {})
+            name = ''
+            if name_prop.get('type') == 'title':
+                name = ''.join(item.get('plain_text', '') for item in name_prop.get('title', [])).strip()
+
+            # Extract Giphy URL
+            giphy_url = properties.get(NOTION_URL_PROPERTY_NAME, {}).get('url') or ''
+
+            if not giphy_url:
+                continue
+
+            channels.append({
+                'name': name,
+                'giphy_url': giphy_url,
+                'notion_status': verif_status.strip(),
+                'created_time': page.get('created_time', ''),
+                'page_id': page.get('id', '')
+            })
+
+        if not data.get('has_more'):
+            break
+        cursor = data.get('next_cursor')
+
+    # Sort channels by created_time so order is stable and sequential
+    channels.sort(key=lambda item: (item.get('created_time') or '', item.get('page_id') or ''))
+    return channels
+
+
+def get_scheduled_channel_urls():
+    """Return the list of channels to check on the scheduled interval."""
+    if NOTION_API_KEY and NOTION_DATABASE_ID:
+        try:
+            channels = get_notion_channels_with_metadata()
+            return [channel['giphy_url'] for channel in channels]
+        except Exception as e:
+            print(f"Warning: failed to load scheduled URLs from Notion: {str(e)}")
+            return SCHEDULED_CHANNEL_URLS
+    return SCHEDULED_CHANNEL_URLS
+
+
+def run_scheduled_channel_check():
+    """Run a full scheduled status check for every configured channel URL sequentially."""
+    urls = get_scheduled_channel_urls()
+    if not urls:
+        raise RuntimeError('No scheduled channel URLs configured. Set NOTION_API_KEY + NOTION_DATABASE_ID or SCHEDULED_CHANNEL_URLS.')
+
+    print(f"\n{'─'*60}")
+    print(f"  Channel Status Check  [{len(urls)} channels]")
+    print(f"{'─'*60}")
+    started_at_dt = datetime.utcnow()
+    started_at = started_at_dt.isoformat() + 'Z'
+    channel_results = []
+
+    for idx, url in enumerate(urls, 1):
+        print(f"  [{idx:>3}/{len(urls)}]", end=' ', flush=True)
+        try:
+            detector_result = detect_channel_status(url)
+            status = detector_result.get('status', 'unknown')
+            channel_username = detector_result.get('channel_username')
+
+            channel_results.append({
+                'source_url': url,
+                'channel_username': channel_username,
+                'status': status,
+                'shadow_banned': status == 'shadow_banned',
+                'banned': status == 'banned',
+                'working': status == 'working',
+                'summary': detector_result.get('summary', {}),
+                'error': detector_result.get('error')
+            })
+            pass  # status logged by detect_channel_status
+        except Exception as e:
+            channel_results.append({
+                'source_url': url,
+                'status': 'error',
+                'error': str(e)
+            })
+            print(f"  ⚠️  [{'ERROR':12}] {url:<35} {str(e)[:60]}")
+        time.sleep(REQUEST_DELAY)
+
+    finished_at = datetime.utcnow().isoformat() + 'Z'
+    working = sum(1 for c in channel_results if c.get('status') == 'working')
+    shadow  = sum(1 for c in channel_results if c.get('status') == 'shadow_banned')
+    banned  = sum(1 for c in channel_results if c.get('status') == 'banned')
+    errors  = sum(1 for c in channel_results if c.get('status') == 'error')
+    print(f"{'─'*60}")
+    print(f"  Done: ✅ {working} working  👻 {shadow} shadow banned  🚫 {banned} banned  ⚠️ {errors} errors")
+    print(f"{'─'*60}\n")
+
+    with scheduled_results_lock:
+        scheduled_results['last_run'] = finished_at
+        scheduled_results['status'] = 'completed'
+        scheduled_results['channels'] = channel_results
+        scheduled_results['error'] = None
+        try:
+            next_dt = datetime.utcnow() + timedelta(seconds=SCHEDULED_CHECK_INTERVAL_SECONDS)
+            scheduled_results['next_run'] = next_dt.isoformat() + 'Z'
+        except Exception:
+            scheduled_results['next_run'] = None
+
+
+def scheduled_channel_checker():
+    """Background thread that runs the channel status check every scheduled interval."""
+    # Wait first — don't block startup with an immediate full check
+    with scheduled_results_lock:
+        scheduled_results['next_run'] = (datetime.utcnow() + timedelta(seconds=SCHEDULED_CHECK_INTERVAL_SECONDS)).isoformat() + 'Z'
+        scheduled_results['status'] = 'idle'
+
+    stop_event.wait(SCHEDULED_CHECK_INTERVAL_SECONDS)
+
+    while not stop_event.is_set():
+        with scheduled_results_lock:
+            scheduled_results['status'] = 'running'
+            scheduled_results['error'] = None
+            try:
+                scheduled_results['next_run'] = (datetime.utcnow() + timedelta(seconds=SCHEDULED_CHECK_INTERVAL_SECONDS)).isoformat() + 'Z'
+            except Exception:
+                scheduled_results['next_run'] = None
+
+        try:
+            run_scheduled_channel_check()
+        except Exception as e:
+            with scheduled_results_lock:
+                scheduled_results['status'] = 'error'
+                scheduled_results['error'] = str(e)
+            print(f"Scheduled channel status check failed: {str(e)}")
+
+        stop_event.wait(SCHEDULED_CHECK_INTERVAL_SECONDS)
+
 # ============================================================================
 # End of Channel Status Detector Functions
 # ============================================================================
@@ -1677,7 +2060,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                         try:
                             views_int = int(views)
                             if views_int > 0:
-                                print(f"  [{location}] Found views via API: {views_int:,}")
+                                _log(f"  [{location}] Found views via API: {views_int:,}")
                                 return views_int
                         except:
                             pass
@@ -1729,7 +2112,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
             try:
                 response = _requests_session.get(test_url, headers=headers, proxies=proxies, timeout=15, allow_redirects=True)
             except Exception as e:
-                print(f"  [{location}] Request error for {test_url}: {str(e)[:50]}")
+                _log(f"  [{location}] Request error for {test_url}: {str(e)[:50]}")
                 continue  # Try next URL
             
             if response.status_code == 200:
@@ -1744,7 +2127,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                         try:
                             views = int(meta_views.get('content'))
                             if views > 0:
-                                print(f"  [{location}] Found views via meta tag ({prop}): {views:,}")
+                                _log(f"  [{location}] Found views via meta tag ({prop}): {views:,}")
                                 return views
                         except:
                             pass
@@ -1756,7 +2139,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                         try:
                             views = int(elem.get('data-views'))
                             if views > 0:
-                                print(f"  [{location}] Found views via data-views attribute: {views:,}")
+                                _log(f"  [{location}] Found views via data-views attribute: {views:,}")
                                 return views
                         except:
                             continue
@@ -1792,7 +2175,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                                         data = json.loads(json_match.group(1))
                                         views = extract_views_from_nested_dict(data)
                                         if views:
-                                            print(f"  [{location}] Found views via data structure: {views:,}")
+                                            _log(f"  [{location}] Found views via data structure: {views:,}")
                                             return views
                                     except:
                                         pass
@@ -1808,7 +2191,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                                         data = json.loads(json_str)
                                         views = extract_views_from_nested_dict(data)
                                         if views:
-                                            print(f"  [{location}] Found views via JSON object: {views:,}")
+                                            _log(f"  [{location}] Found views via JSON object: {views:,}")
                                             return views
                                     except:
                                         # Try to find a valid JSON subset
@@ -1817,7 +2200,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                                                 data = json.loads(json_str[:i] + '}')
                                                 views = extract_views_from_nested_dict(data)
                                                 if views:
-                                                    print(f"  [{location}] Found views via JSON subset: {views:,}")
+                                                    _log(f"  [{location}] Found views via JSON subset: {views:,}")
                                                     return views
                                             except:
                                                 continue
@@ -1840,7 +2223,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                                         view_nums = [int(m) for m in matches if int(m) > 10]
                                         if view_nums:
                                             views = max(view_nums)
-                                            print(f"  [{location}] Found views in script via regex: {views:,}")
+                                            _log(f"  [{location}] Found views in script via regex: {views:,}")
                                             return views
                                     except:
                                         continue
@@ -1853,7 +2236,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                             data = json.loads(script_content)
                             views = extract_views_from_nested_dict(data)
                             if views:
-                                print(f"  [{location}] Found views via JSON script: {views:,}")
+                                _log(f"  [{location}] Found views via JSON script: {views:,}")
                                 return views
                         except:
                             continue
@@ -1873,7 +2256,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                                     view_nums = [int(m) for m in matches if int(m) > 10]
                                     if view_nums:
                                         views = max(view_nums)
-                                        print(f"  [{location}] Found views in script tag via pattern: {views:,}")
+                                        _log(f"  [{location}] Found views in script tag via pattern: {views:,}")
                                         return views
                                 except:
                                     continue
@@ -1921,7 +2304,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                             reasonable_views = [v for v in view_numbers if v < 1000000000]  # Less than 1 billion
                             if reasonable_views:
                                 views = max(reasonable_views)
-                                print(f"  [{location}] Found views via pattern matching: {views:,}")
+                                _log(f"  [{location}] Found views via pattern matching: {views:,}")
                                 return views
                     except:
                         pass
@@ -1957,7 +2340,7 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                                 if view_numbers:
                                     # Use the largest number (likely the actual view count)
                                     views = max(view_numbers)
-                                    print(f"  [{location}] Found views in page text: {views:,}")
+                                    _log(f"  [{location}] Found views in page text: {views:,}")
                                     return views
                             except:
                                 continue
@@ -1972,14 +2355,14 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                             try:
                                 views = int(view_match.group(1).replace(',', ''))
                                 if views > 10:
-                                    print(f"  [{location}] Found views in visible text element: {views:,}")
+                                    _log(f"  [{location}] Found views in visible text element: {views:,}")
                                     return views
                             except:
                                 continue
                 except:
                     pass
                 
-                print(f"  [{location}] Could not extract views from {test_url}")
+                _log(f"  [{location}] Could not extract views from {test_url}")
                 # Continue to next URL format if this one didn't work
                 continue
             else:
@@ -1987,12 +2370,12 @@ def scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=
                 continue
         
         # All URLs failed
-        print(f"  [{location}] All URL formats failed for GIF {gif_id}")
+        _log(f"  [{location}] All URL formats failed for GIF {gif_id}")
             
     except requests.exceptions.ProxyError as e:
-        print(f"  [{location}] Proxy error: {str(e)}")
+        _log(f"  [{location}] Proxy error: {str(e)}")
     except Exception as e:
-        print(f"  [{location}] Error scraping views: {str(e)}")
+        _log(f"  [{location}] Error scraping views: {str(e)}")
     
     return None
 
@@ -2020,7 +2403,7 @@ def check_views_multiple_locations(gif_id, sample_count=3):
     }
     
     # Check from default location (no proxy)
-    print(f"Checking views for GIF {gif_id}...")
+    _log(f"Checking views for GIF {gif_id}...")
     for i in range(sample_count):
         views = scrape_gif_views_with_proxy(gif_id, proxy=None, location='default')
         if views is not None:
@@ -2030,7 +2413,7 @@ def check_views_multiple_locations(gif_id, sample_count=3):
     
     # Check from India proxy (if configured)
     if PROXY_CONFIGS.get('india'):
-        print(f"  Checking from India proxy...")
+        _log(f"  Checking from India proxy...")
         for i in range(sample_count):
             views = scrape_gif_views_with_proxy(gif_id, proxy=PROXY_CONFIGS['india'], location='india')
             if views is not None:
@@ -2038,11 +2421,11 @@ def check_views_multiple_locations(gif_id, sample_count=3):
             if i < sample_count - 1:
                 time.sleep(1)
     else:
-        print(f"  India proxy not configured, skipping...")
+        _log(f"  India proxy not configured, skipping...")
     
     # Check from USA proxy (if configured)
     if PROXY_CONFIGS.get('usa'):
-        print(f"  Checking from USA proxy...")
+        _log(f"  Checking from USA proxy...")
         for i in range(sample_count):
             views = scrape_gif_views_with_proxy(gif_id, proxy=PROXY_CONFIGS['usa'], location='usa')
             if views is not None:
@@ -2050,7 +2433,7 @@ def check_views_multiple_locations(gif_id, sample_count=3):
             if i < sample_count - 1:
                 time.sleep(1)
     else:
-        print(f"  USA proxy not configured, skipping...")
+        _log(f"  USA proxy not configured, skipping...")
     
     # Calculate averages for each location
     for location, views_list in location_views.items():
@@ -2156,11 +2539,11 @@ def analyze_channel_status_with_location_checks(channel_id, days=2):
         historical_views = {}
         current_views = {}
         
-        print(f"\n{'='*60}")
-        print(f"ANALYZING CHANNEL: {channel_id} (Multi-Location View Check)")
-        print(f"{'='*60}")
-        print(f"Total GIFs: {len(gif_ids)}")
-        print(f"Checking views over last {days} days...\n")
+        _log(f"\n{'='*60}")
+        _log(f"ANALYZING CHANNEL: {channel_id} (Multi-Location View Check)")
+        _log(f"{'='*60}")
+        # print(f"Total GIFs: {len(gif_ids)}")
+        _log(f"Checking views over last {days} days...\n")
         
         # Check historical views from database
         for gif_id in gif_ids:
@@ -2177,7 +2560,7 @@ def analyze_channel_status_with_location_checks(channel_id, days=2):
         total_views_increase = 0
         
         for idx, gif_id in enumerate(gif_ids[:20], 1):  # Limit to first 20 GIFs for performance
-            print(f"[{idx}/{min(20, len(gif_ids))}] Checking GIF: {gif_id}")
+            _log(f"[{idx}/{min(20, len(gif_ids))}] Checking GIF: {gif_id}")
             
             # Get current views from multiple locations
             location_check = check_views_multiple_locations(gif_id, sample_count=1)
@@ -2193,30 +2576,30 @@ def analyze_channel_status_with_location_checks(channel_id, days=2):
                     view_change = current_view - oldest_view
                     view_change_percent = (view_change / oldest_view * 100) if oldest_view > 0 else 0
                     
-                    print(f"  Current: {current_view:,} | Historical: {oldest_view:,} | Change: {view_change:+,} ({view_change_percent:+.1f}%)")
+                    _log(f"  Current: {current_view:,} | Historical: {oldest_view:,} | Change: {view_change:+,} ({view_change_percent:+.1f}%)")
                     
                     # Determine trend
                     if view_change > 0 and view_change_percent > 5:  # 5% increase threshold
                         gifs_with_increasing_views += 1
                         total_views_increase += view_change
-                        print(f"  ✓ Views INCREASING")
+                        _log(f"  ✓ Views INCREASING")
                     elif view_change < 0 and abs(view_change_percent) > 5:
                         gifs_with_decreasing_views += 1
-                        print(f"  ✗ Views DECREASING")
+                        _log(f"  ✗ Views DECREASING")
                     else:
                         gifs_with_stagnant_views += 1
-                        print(f"  - Views STAGNANT")
+                        _log(f"  - Views STAGNANT")
                 else:
                     # No historical data, but we have current views
                     if current_view > 0:
                         gifs_with_increasing_views += 1  # Optimistic: if we can see views, it's working
-                        print(f"  ✓ Has views (no historical data)")
+                        _log(f"  ✓ Has views (no historical data)")
                     else:
                         gifs_with_no_views += 1
-                        print(f"  ✗ No views detected")
+                        _log(f"  ✗ No views detected")
             else:
                 gifs_with_no_views += 1
-                print(f"  ✗ Could not fetch views")
+                _log(f"  ✗ Could not fetch views")
             
             # Store current view for future comparison
             if location_check['success']:
@@ -2228,14 +2611,14 @@ def analyze_channel_status_with_location_checks(channel_id, days=2):
         # Determine overall status
         total_checked = gifs_with_increasing_views + gifs_with_stagnant_views + gifs_with_decreasing_views + gifs_with_no_views
         
-        print(f"\n{'='*60}")
-        print(f"ANALYSIS RESULTS:")
-        print(f"  GIFs with increasing views: {gifs_with_increasing_views}")
-        print(f"  GIFs with stagnant views: {gifs_with_stagnant_views}")
-        print(f"  GIFs with decreasing views: {gifs_with_decreasing_views}")
-        print(f"  GIFs with no views: {gifs_with_no_views}")
-        print(f"  Total views increase: {total_views_increase:,}")
-        print(f"{'='*60}\n")
+        _log(f"\n{'='*60}")
+        _log(f"ANALYSIS RESULTS:")
+        _log(f"  GIFs with increasing views: {gifs_with_increasing_views}")
+        _log(f"  GIFs with stagnant views: {gifs_with_stagnant_views}")
+        _log(f"  GIFs with decreasing views: {gifs_with_decreasing_views}")
+        _log(f"  GIFs with no views: {gifs_with_no_views}")
+        _log(f"  Total views increase: {total_views_increase:,}")
+        _log(f"{'='*60}\n")
         
         # Decision logic
         if total_checked == 0:
@@ -2627,7 +3010,7 @@ def fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=True):
     today = datetime.now().date()
     
     mode = "real-time" if not store_in_db else "with storage"
-    print(f"  Fetching CURRENT views from Giphy API ({mode}) for {len(gif_ids)} GIFs...")
+    _log(f"  Fetching CURRENT views from Giphy API ({mode}) for {len(gif_ids)} GIFs...")
     
     for gif_id in gif_ids:
         try:
@@ -2652,19 +3035,19 @@ def fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=True):
                             if store_in_db:
                                 store_view_count(gif_id, views_int, recorded_date=today)
                             
-                            print(f"    ✓ {gif_id[:12]}...: {views_int:,} views (from API - {mode})")
+                            _log(f"    ✓ {gif_id[:12]}...: {views_int:,} views (from API - {mode})")
                     except (ValueError, TypeError):
                         pass
             else:
-                print(f"    ✗ {gif_id[:12]}...: API returned {gif_detail_response.status_code}")
+                _log(f"    ✗ {gif_id[:12]}...: API returned {gif_detail_response.status_code}")
         except Exception as e:
-            print(f"    ✗ {gif_id[:12]}...: Error - {str(e)[:50]}")
+            _log(f"    ✗ {gif_id[:12]}...: Error - {str(e)[:50]}")
         
         # Small delay to avoid rate limiting
         time.sleep(0.2)
     
-    print(f"  ✓ Fetched views for {fetched_count}/{len(gif_ids)} GIFs from API ({mode})")
-    print(f"  ✓ Total views from API: {total_views:,}")
+    _log(f"  ✓ Fetched views for {fetched_count}/{len(gif_ids)} GIFs from API ({mode})")
+    _log(f"  ✓ Total views from API: {total_views:,}")
     
     return {
         'total_views': total_views,
@@ -2814,12 +3197,12 @@ def analyze_view_trends(gif_ids, days=7, channel_id=None, use_24_hour_comparison
         if total_views_yesterday > 0:
             yesterday_data_available = True
             comparison_method = '24_hour'
-            print(f"  Using 24-hour comparison: Found views from {previous_timestamp} (24 hours ago)")
+            _log(f"  Using 24-hour comparison: Found views from {previous_timestamp} (24 hours ago)")
             
             # Also get 48-hour data for longer trend analysis
             total_views_48h_ago, previous_48h_timestamp = get_channel_total_views_48_hours_ago(channel_id)
             if total_views_48h_ago > 0:
-                print(f"  Using 48-hour comparison: Found views from {previous_48h_timestamp} (48 hours ago)")
+                _log(f"  Using 48-hour comparison: Found views from {previous_48h_timestamp} (48 hours ago)")
     
     # APPROACH 2: Date-based comparison (fallback or if 24-hour didn't work)
     if not yesterday_data_available:
@@ -2832,7 +3215,7 @@ def analyze_view_trends(gif_ids, days=7, channel_id=None, use_24_hour_comparison
             if total_views_yesterday > 0:
                 yesterday_data_available = True
                 comparison_method = 'date_based'
-                print(f"  Using date-based comparison: Found views from {yesterday}")
+                _log(f"  Using date-based comparison: Found views from {yesterday}")
     
     # Get today's total views and verify yesterday's data
     for gif_id in gif_ids:
@@ -2890,7 +3273,7 @@ def analyze_view_trends(gif_ids, days=7, channel_id=None, use_24_hour_comparison
     elif total_views_48h_ago > 0 and total_views_today > total_views_48h_ago:
         # 24h stagnant but 48h shows growth - consider as increasing (real-time detection)
         trend = 'increasing_48h'
-        print(f"  Note: 24h stagnant but 48h shows growth (+{views_difference_48h:,} views) - treating as increasing")
+        _log(f"  Note: 24h stagnant but 48h shows growth (+{views_difference_48h:,} views) - treating as increasing")
     elif total_views_today < total_views_yesterday:
         trend = 'decreasing'
     elif gifs_with_views == 0:
@@ -3136,7 +3519,7 @@ def check_channel_via_web_scraping(channel_identifier, original_url):
                                         all_gifs_from_page = page_props['data']
                                 
                                 if all_gifs_from_page and len(all_gifs_from_page) > 0:
-                                    print(f"  ✓ Extracted {len(all_gifs_from_page)} GIFs from page data")
+                                    _log(f"  ✓ Extracted {len(all_gifs_from_page)} GIFs from page data")
                                     
                             except Exception as e:
                                 # Debug: log the error for troubleshooting
@@ -3177,7 +3560,7 @@ def check_channel_via_web_scraping(channel_identifier, original_url):
                                                 reasonable_counts = [c for c in potential_counts if 0 <= c <= 100000]
                                                 if reasonable_counts:
                                                     upload_count = max(reasonable_counts)  # Take the largest reasonable number
-                                                    print(f"  ✓ Extracted upload count from pattern: {upload_count}")
+                                                    _log(f"  ✓ Extracted upload count from pattern: {upload_count}")
                                                     break
                                         except:
                                             continue
@@ -3216,26 +3599,26 @@ def check_channel_via_web_scraping(channel_identifier, original_url):
                                                     candidate = int(float(view_str.upper().replace('K', '')) * 1000)
                                                     if 100 <= candidate <= 1000000000:  # Reasonable range
                                                         views_count = candidate
-                                                        print(f"  ✓ Extracted views count from pattern: {views_count:,}")
+                                                        _log(f"  ✓ Extracted views count from pattern: {views_count:,}")
                                                         break
                                                 elif 'M' in view_str.upper():
                                                     candidate = int(float(view_str.upper().replace('M', '')) * 1000000)
                                                     if 100 <= candidate <= 10000000000:  # Reasonable range
                                                         views_count = candidate
-                                                        print(f"  ✓ Extracted views count from pattern: {views_count:,}")
+                                                        _log(f"  ✓ Extracted views count from pattern: {views_count:,}")
                                                         break
                                                 elif 'B' in view_str.upper():
                                                     candidate = int(float(view_str.upper().replace('B', '')) * 1000000000)
                                                     if 100 <= candidate <= 100000000000:  # Reasonable range
                                                         views_count = candidate
-                                                        print(f"  ✓ Extracted views count from pattern: {views_count:,}")
+                                                        _log(f"  ✓ Extracted views count from pattern: {views_count:,}")
                                                         break
                                                 else:
                                                     try:
                                                         candidate = int(float(view_str))
                                                         if 100 <= candidate <= 1000000000:  # Reasonable range
                                                             views_count = candidate
-                                                            print(f"  ✓ Extracted views count from pattern: {views_count:,}")
+                                                            _log(f"  ✓ Extracted views count from pattern: {views_count:,}")
                                                             break
                                                     except:
                                                         continue
@@ -3274,7 +3657,7 @@ def check_channel_via_web_scraping(channel_identifier, original_url):
                                         candidate_upload = int(simple_upload_match.group(1))
                                         if 0 <= candidate_upload <= 100000:
                                             upload_count = candidate_upload
-                                            print(f"  ✓ Extracted upload count (final fallback): {upload_count}")
+                                            _log(f"  ✓ Extracted upload count (final fallback): {upload_count}")
                                     except:
                                         pass
                                 
@@ -3291,7 +3674,7 @@ def check_channel_via_web_scraping(channel_identifier, original_url):
                                             candidate_view = int(float(view_str))
                                         if 100 <= candidate_view <= 1000000000:
                                             views_count = candidate_view
-                                            print(f"  ✓ Extracted views count (final fallback): {views_count:,}")
+                                            _log(f"  ✓ Extracted views count (final fallback): {views_count:,}")
                                     except:
                                         pass
                             except:
@@ -3334,22 +3717,22 @@ def check_channel_via_web_scraping(channel_identifier, original_url):
                                 results['status'] = 'banned'
                                 results['working'] = False
                                 results['shadow_banned'] = False
-                                print(f"  🚫 Page shows 0 uploads and 0 views - BANNED")
+                                _log(f"  🚫 Page shows 0 uploads and 0 views - BANNED")
                                 return results
                             else:
                                 # Page shows metrics (uploads > 0 OR views > 0) - NOT BANNED
                                 # Continue to check search visibility to determine if working or shadow banned
-                                print(f"  ✓ Page shows metrics: {upload_count} uploads, {views_count:,} views")
+                                _log(f"  ✓ Page shows metrics: {upload_count} uploads, {views_count:,} views")
                                 results['banned'] = False
                                 # Don't set status yet - need to check search visibility via analyze_channel_status
                         elif upload_count is not None or views_count is not None:
                             # At least one metric found - page shows metrics - NOT BANNED
-                            print(f"  ✓ Page shows metrics: uploads={upload_count}, views={views_count}")
+                            _log(f"  ✓ Page shows metrics: uploads={upload_count}, views={views_count}")
                             results['banned'] = False
                         else:
                             # No metrics extracted - might be banned or extraction failed
                             # But page is accessible (status 200), so it exists
-                            print(f"  ⚠️  Could not extract metrics from page (page exists but extraction failed)")
+                            _log(f"  ⚠️  Could not extract metrics from page (page exists but extraction failed)")
                             # Don't mark as banned yet - let analyze_channel_status check search visibility
                             # Since page is accessible, it's not banned - might be shadow banned or working
                             results['banned'] = False
@@ -3604,14 +3987,14 @@ def check_gifs_one_by_one_with_tags(all_gifs_list, channel_id, max_gifs_to_check
         total_tags_found = 0
         gifs_details = []
         
-        print(f"  Checking {len(gifs_to_check)} GIFs one by one with their tags from API...")
+        _log(f"  Checking {len(gifs_to_check)} GIFs one by one with their tags from API...")
         
         for idx, gif_data in enumerate(gifs_to_check, 1):
             gif_id = gif_data.get('id')
             if not gif_id:
                 continue
             
-            print(f"\n  [{idx}/{len(gifs_to_check)}] Checking GIF: {gif_id[:12]}...")
+            _log(f"\n  [{idx}/{len(gifs_to_check)}] Checking GIF: {gif_id[:12]}...")
             
             # Get tags from GIF detail endpoint (tags are in the API response)
             tags = []
@@ -3650,11 +4033,11 @@ def check_gifs_one_by_one_with_tags(all_gifs_list, channel_id, max_gifs_to_check
                                 tags = [t.lower() for t in slug_parts if t and len(t) >= 2][:10]
                 
             except Exception as e:
-                print(f"    ⚠️  Error fetching tags for GIF {gif_id[:12]}...: {str(e)[:50]}")
+                _log(f"    ⚠️  Error fetching tags for GIF {gif_id[:12]}...: {str(e)[:50]}")
                 continue
             
             if not tags:
-                print(f"    ⚠️  No tags found for GIF {gif_id[:12]}...")
+                _log(f"    ⚠️  No tags found for GIF {gif_id[:12]}...")
                 gifs_details.append({
                     'gif_id': gif_id,
                     'tags': [],
@@ -3664,7 +4047,7 @@ def check_gifs_one_by_one_with_tags(all_gifs_list, channel_id, max_gifs_to_check
                 })
                 continue
             
-            print(f"    Found {len(tags)} tags: {tags[:5]}{'...' if len(tags) > 5 else ''}")
+            _log(f"    Found {len(tags)} tags: {tags[:5]}{'...' if len(tags) > 5 else ''}")
             
             # Test each tag - check if this SAME GIF appears in search results
             tags_found_count = 0
@@ -3709,15 +4092,15 @@ def check_gifs_one_by_one_with_tags(all_gifs_list, channel_id, max_gifs_to_check
                             total_tags_found += 1
                             tags_found_list.append(tag)
                             matching_count = len(matching_gif_ids)
-                            print(f"      ✓ Tag '{tag}': Found {matching_count} GIF(s) from same channel in search results")
+                            _log(f"      ✓ Tag '{tag}': Found {matching_count} GIF(s) from same channel in search results")
                         else:
                             tags_not_found_list.append(tag)
-                            print(f"      ✗ Tag '{tag}': No GIFs from same channel found in search results")
+                            _log(f"      ✗ Tag '{tag}': No GIFs from same channel found in search results")
                     
                     time.sleep(0.2)  # Small delay to avoid rate limiting
                     
                 except Exception as e:
-                    print(f"      ⚠️  Error testing tag '{tag}': {str(e)[:50]}")
+                    _log(f"      ⚠️  Error testing tag '{tag}': {str(e)[:50]}")
                     tags_not_found_list.append(tag)
                     continue
             
@@ -3738,7 +4121,7 @@ def check_gifs_one_by_one_with_tags(all_gifs_list, channel_id, max_gifs_to_check
             })
             
             status_icon = "✅" if is_gif_working else "❌"
-            print(f"    {status_icon} GIF result: {tags_found_count}/{tags_tested_count} tags found GIFs from same channel ({'WORKING' if is_gif_working else 'NOT WORKING'})")
+            _log(f"    {status_icon} GIF result: {tags_found_count}/{tags_tested_count} tags found GIFs from same channel ({'WORKING' if is_gif_working else 'NOT WORKING'})")
             
             # Small delay between GIFs
             if idx < len(gifs_to_check):
@@ -3749,12 +4132,12 @@ def check_gifs_one_by_one_with_tags(all_gifs_list, channel_id, max_gifs_to_check
         # Otherwise → SHADOW BANNED
         is_working = gifs_with_5_plus_tags > 0
         
-        print(f"\n  Summary:")
-        print(f"    GIFs checked: {len(gifs_details)}")
-        print(f"    GIFs with tags found (same channel): {gifs_with_5_plus_tags}")
-        print(f"    Total tags tested: {total_tags_tested}")
-        print(f"    Total tags found: {total_tags_found}")
-        print(f"    Overall status: {'✅ WORKING' if is_working else '❌ SHADOW BANNED'}")
+        _log(f"\n  Summary:")
+        _log(f"    GIFs checked: {len(gifs_details)}")
+        _log(f"    GIFs with tags found (same channel): {gifs_with_5_plus_tags}")
+        _log(f"    Total tags tested: {total_tags_tested}")
+        _log(f"    Total tags found: {total_tags_found}")
+        _log(f"    Overall status: {'✅ WORKING' if is_working else '❌ SHADOW BANNED'}")
         
         return {
             'gifs_checked': len(gifs_details),
@@ -3804,7 +4187,7 @@ def check_tags_in_search_results(tags_list, channel_id, sample_gif_ids=None):
         
         # Test up to 10 tags
         tags_to_test = tags_list[:10]
-        print(f"  Testing {len(tags_to_test)} tags from GIF URLs...")
+        _log(f"  Testing {len(tags_to_test)} tags from GIF URLs...")
         
         for tag in tags_to_test:
             try:
@@ -3836,22 +4219,22 @@ def check_tags_in_search_results(tags_list, channel_id, sample_gif_ids=None):
                     
                     if found_channel_gif:
                         tags_visible.append(tag)
-                        print(f"    ✓ Tag '{tag}': Found channel GIFs in search")
+                        _log(f"    ✓ Tag '{tag}': Found channel GIFs in search")
                     else:
                         tags_not_visible.append(tag)
-                        print(f"    ✗ Tag '{tag}': No channel GIFs in search")
+                        _log(f"    ✗ Tag '{tag}': No channel GIFs in search")
                 
                 time.sleep(0.3)  # Small delay to avoid rate limiting
                 
             except Exception as e:
-                print(f"    ⚠️  Error testing tag '{tag}': {str(e)[:50]}")
+                _log(f"    ⚠️  Error testing tag '{tag}': {str(e)[:50]}")
                 tags_not_visible.append(tag)
                 continue
         
         tags_found = len(tags_visible)
         is_working = tags_found >= 5  # 5+ tags found = WORKING
         
-        print(f"  Tag visibility: {tags_found}/{len(tags_to_test)} tags found channel GIFs in search")
+        _log(f"  Tag visibility: {tags_found}/{len(tags_to_test)} tags found channel GIFs in search")
         
         return {
             'tags_tested': len(tags_to_test),
@@ -3910,12 +4293,12 @@ def check_channel_in_search_results(channel_id, sample_gif_ids=None, all_gifs_li
         if all_gifs_list and len(all_gifs_list) > 0:
             keywords = extract_keywords_from_gifs(all_gifs_list, max_keywords=5)
             queries_to_test.extend(keywords)
-            print(f"  Extracted {len(keywords)} keywords from GIF titles/URLs: {keywords[:3]}...")
+            _log(f"  Extracted {len(keywords)} keywords from GIF titles/URLs: {keywords[:3]}...")
         
         # Limit total queries to test (to avoid too many API calls)
         queries_to_test = queries_to_test[:6]  # Max 6 queries: channel name + 5 keywords
         
-        print(f"  Testing {len(queries_to_test)} search queries...")
+        _log(f"  Testing {len(queries_to_test)} search queries...")
         
         # Test each query
         for query in queries_to_test:
@@ -3966,21 +4349,21 @@ def check_channel_in_search_results(channel_id, sample_gif_ids=None, all_gifs_li
                             'query': query,
                             'matching_gifs': query_matching_gifs
                         })
-                        print(f"    ✓ '{query}': Found {query_matching_gifs} matching GIFs")
+                        _log(f"    ✓ '{query}': Found {query_matching_gifs} matching GIFs")
                     else:
-                        print(f"    ✗ '{query}': No matching GIFs")
+                        _log(f"    ✗ '{query}': No matching GIFs")
                 
                 # Small delay to avoid rate limiting
                 time.sleep(0.3)
                 
             except Exception as e:
-                print(f"    ⚠️  Error testing query '{query}': {str(e)[:50]}")
+                _log(f"    ⚠️  Error testing query '{query}': {str(e)[:50]}")
                 continue
         
         # Determine visibility based on results
         visible = total_matching_gifs > 0 or len(successful_queries) > 0
         
-        print(f"  Results: {len(successful_queries)}/{len(search_queries_tested)} queries found channel GIFs")
+        _log(f"  Results: {len(successful_queries)}/{len(search_queries_tested)} queries found channel GIFs")
         
         return {
             'visible_in_search': visible,
@@ -4051,15 +4434,15 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
     if uploads_from_page is not None:
         total_uploads = uploads_from_page
     
-    print(f"\n{'='*50}")
-    print(f"ANALYZING CHANNEL STATUS (Step-by-Step Logic)")
-    print(f"{'='*50}")
-    print(f"Channel ID: {channel_id}")
-    print(f"Uploads from page: {uploads_from_page}")
-    print(f"Views from page: {views_from_page}")
-    print(f"Total uploads: {total_uploads} ({gifs_count} GIFs)")
-    print(f"User ID available: {user_id is not None}")
-    print(f"GIFs endpoint 404: {gifs_endpoint_404}")
+    _log(f"\n{'='*50}")
+    _log(f"ANALYZING CHANNEL STATUS (Step-by-Step Logic)")
+    _log(f"{'='*50}")
+    _log(f"Channel ID: {channel_id}")
+    _log(f"Uploads from page: {uploads_from_page}")
+    _log(f"Views from page: {views_from_page}")
+    _log(f"Total uploads: {total_uploads} ({gifs_count} GIFs)")
+    _log(f"User ID available: {user_id is not None}")
+    _log(f"GIFs endpoint 404: {gifs_endpoint_404}")
     
     # ===================================================================
     # STEP 1: Check if page shows upload count and views count from channel URL
@@ -4067,7 +4450,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
     # BANNED = Page shows 0 uploads AND 0 views (page doesn't display metrics)
     # If page shows metrics (upload_count > 0 OR views_count > 0) → Continue to STEP 2
     
-    print("STEP 1: Checking if page shows upload count and views count...")
+    _log("STEP 1: Checking if page shows upload count and views count...")
     
     # Check if page shows metrics (from web scraping)
     # - None = extraction failed (page exists but we couldn't extract)
@@ -4085,15 +4468,15 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
         analysis['shadow_banned'] = False
         analysis['status'] = 'banned'
         analysis['analysis_reasons'].append('🚫 BANNED: Channel page does NOT show GIF count and views count (page shows 0 uploads and 0 views)')
-        print("  🚫 BANNED: Channel page does NOT show GIF count and views count")
-        print("     Page shows 0 uploads and 0 views - channel is banned")
+        _log("  🚫 BANNED: Channel page does NOT show GIF count and views count")
+        _log("     Page shows 0 uploads and 0 views - channel is banned")
         return analysis
     
     # If page shows metrics (uploads > 0 OR views > 0), continue analysis
     if uploads_from_page is not None and uploads_from_page > 0:
-        print(f"  ✓ Page shows {uploads_from_page} uploads")
+        _log(f"  ✓ Page shows {uploads_from_page} uploads")
     if views_from_page is not None and views_from_page > 0:
-        print(f"  ✓ Page shows {views_from_page:,} views")
+        _log(f"  ✓ Page shows {views_from_page:,} views")
     
     # Factor 1: BANNED - Channel not found, content not visible, NO VIEWS
     # BANNED = Channel shows nothing, no views, no content accessible
@@ -4105,7 +4488,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
         analysis['shadow_banned'] = False
         analysis['status'] = 'banned'
         analysis['analysis_reasons'].append('🚫 BANNED: Channel not found or content not visible in API - no views, no content accessible')
-        print("  🚫 BANNED: Channel/content not visible - no views, no content")
+        _log("  🚫 BANNED: Channel/content not visible - no views, no content")
         return analysis
     
     # Get GIF IDs for analysis
@@ -4116,7 +4499,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
     if not gif_ids:
         # If page shows metrics (uploads > 0 AND views > 0), try to fetch GIFs for tag checking
         if (uploads_from_page is not None and uploads_from_page > 0) and (views_from_page is not None and views_from_page > 0):
-            print("  ⚠️  No GIFs from API but page shows metrics - fetching GIFs for tag checking...")
+            _log("  ⚠️  No GIFs from API but page shows metrics - fetching GIFs for tag checking...")
             # Try to fetch GIFs using username parameter (same as Method 1 in check_channel_status)
             try:
                 if GIPHY_API_KEY and GIPHY_API_KEY != 'dc6zaTOxFJmzC' and channel_id:
@@ -4139,18 +4522,18 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                                 matching_gifs.append(gif)
                         
                         if matching_gifs:
-                            print(f"  ✓ Fetched {len(matching_gifs)} GIFs from API for tag checking")
+                            _log(f"  ✓ Fetched {len(matching_gifs)} GIFs from API for tag checking")
                             all_gifs_list = matching_gifs
                             gif_ids = [gif.get('id') for gif in all_gifs_list if gif.get('id')]
                         else:
-                            print(f"  ⚠️  No matching GIFs found via API search (page shows metrics but API returned no GIFs)")
+                            _log(f"  ⚠️  No matching GIFs found via API search (page shows metrics but API returned no GIFs)")
             except Exception as e:
-                print(f"  ⚠️  Error fetching GIFs for tag checking: {str(e)[:50]}")
+                _log(f"  ⚠️  Error fetching GIFs for tag checking: {str(e)[:50]}")
         
         # If still no GIFs but page shows metrics, continue to search visibility check below
         if not gif_ids:
             if (uploads_from_page is not None and uploads_from_page > 0) or (views_from_page is not None and views_from_page > 0):
-                print("  ⚠️  No GIFs available but page shows metrics - checking search visibility with channel name...")
+                _log("  ⚠️  No GIFs available but page shows metrics - checking search visibility with channel name...")
                 # Continue to search visibility check below (will use channel name only)
             else:
                 # No GIFs and no metrics from page - cannot determine
@@ -4164,9 +4547,9 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
     # If 5+ tags return the same GIF → WORKING
     # If no GIFs from channel appear → SHADOW BANNED
     # ===================================================================
-    print(f"\n{'='*50}")
-    print(f"STEP 3 & 4: Check GIFs one by one with tags from API")
-    print(f"{'='*50}")
+    _log(f"\n{'='*50}")
+    _log(f"STEP 3 & 4: Check GIFs one by one with tags from API")
+    _log(f"{'='*50}")
     
     search_visibility = None
     visible_in_search = False
@@ -4176,9 +4559,9 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
         try:
             # If we have GIFs, check them one by one with their tags
             if all_gifs_list and len(all_gifs_list) > 0:
-                print(f"  Checking GIFs from channel '{channel_id}' one by one...")
-                print(f"  For each GIF: get maximum 5 tags from API, search each tag, check if GIFs from same channel appear")
-                print(f"  If any tag returns GIFs from same channel → WORKING")
+                _log(f"  Checking GIFs from channel '{channel_id}' one by one...")
+                _log(f"  For each GIF: get maximum 5 tags from API, search each tag, check if GIFs from same channel appear")
+                _log(f"  If any tag returns GIFs from same channel → WORKING")
                 
                 # Check GIFs one by one with their tags
                 gifs_check_result = check_gifs_one_by_one_with_tags(all_gifs_list, channel_id, max_gifs_to_check=10)
@@ -4199,21 +4582,21 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                     }
                     
                     if visible_in_search:
-                        print(f"\n  ✅ SEARCH RESULT: VISIBLE")
-                        print(f"     {gifs_with_5_plus_tags} GIF(s) have tags that return GIFs from same channel in search")
-                        print(f"     Total: {total_tags_found}/{total_tags_tested} tags found channel GIFs in search")
+                        _log(f"\n  ✅ SEARCH RESULT: VISIBLE")
+                        _log(f"     {gifs_with_5_plus_tags} GIF(s) have tags that return GIFs from same channel in search")
+                        _log(f"     Total: {total_tags_found}/{total_tags_tested} tags found channel GIFs in search")
                     else:
-                        print(f"\n  👻 SEARCH RESULT: NOT VISIBLE")
-                        print(f"     No GIFs have tags that return GIFs from same channel in search")
-                        print(f"     Total: {total_tags_found}/{total_tags_tested} tags found channel GIFs in search")
+                        _log(f"\n  👻 SEARCH RESULT: NOT VISIBLE")
+                        _log(f"     No GIFs have tags that return GIFs from same channel in search")
+                        _log(f"     Total: {total_tags_found}/{total_tags_tested} tags found channel GIFs in search")
                     
                     analysis['search_visibility'] = search_visibility
                 else:
                     error_msg = gifs_check_result.get('error', 'Unknown error') if gifs_check_result else 'No result'
-                    print(f"  ⚠️  GIFs check failed: {error_msg}")
+                    _log(f"  ⚠️  GIFs check failed: {error_msg}")
             else:
                 # No GIFs available - check channel name in search as fallback
-                print(f"  No GIFs available from API - checking channel name in search...")
+                _log(f"  No GIFs available from API - checking channel name in search...")
                 search_visibility_result = check_channel_in_search_results(channel_id, sample_gif_ids=None, all_gifs_list=None)
                 if search_visibility_result and not search_visibility_result.get('error'):
                     visible_in_search = search_visibility_result.get('visible_in_search', False)
@@ -4228,22 +4611,22 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                     }
                     
                     if visible_in_search:
-                        print(f"\n  ✅ SEARCH RESULT: VISIBLE")
-                        print(f"     Channel name found in search ({matching_count} GIFs)")
+                        _log(f"\n  ✅ SEARCH RESULT: VISIBLE")
+                        _log(f"     Channel name found in search ({matching_count} GIFs)")
                         tags_visible_count = 1
                     else:
-                        print(f"\n  👻 SEARCH RESULT: NOT VISIBLE")
-                        print(f"     Channel name not found in search")
+                        _log(f"\n  👻 SEARCH RESULT: NOT VISIBLE")
+                        _log(f"     Channel name not found in search")
                     
                     analysis['search_visibility'] = search_visibility
                 else:
-                    print(f"  ⚠️  Search check failed")
+                    _log(f"  ⚠️  Search check failed")
         except Exception as e:
-            print(f"  ⚠️  GIFs check error: {str(e)}")
+            _log(f"  ⚠️  GIFs check error: {str(e)}")
     
-    print(f"\n{'='*50}")
-    print(f"CHECK 2: View Trends Analysis")
-    print(f"{'='*50}")
+    _log(f"\n{'='*50}")
+    _log(f"CHECK 2: View Trends Analysis")
+    _log(f"{'='*50}")
     
     # Check for view trends in database (LAST 2 DAYS)
     view_trend_analysis = None
@@ -4264,7 +4647,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
             
             # If no history and auto_check_views is enabled, try real-time comparison first
             if not has_history and auto_check_views:
-                print(f"  No database history found. Trying real-time comparison...")
+                _log(f"  No database history found. Trying real-time comparison...")
                 
                 # Try real-time cache comparison first (no database storage)
                 try:
@@ -4272,20 +4655,20 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                     
                     if realtime_comparison['comparison']['status'] != 'no_previous':
                         # Real-time comparison worked - use it
-                        print(f"  ✓ Real-time comparison available (using cache, no database storage)")
+                        _log(f"  ✓ Real-time comparison available (using cache, no database storage)")
                         # Skip database storage and use real-time data
                         has_history = True  # Mark as having data for analysis
                     else:
                         # First time - no previous cache, fetch current views
-                        print(f"  First time checking - fetching current views from Giphy API...")
-                        print(f"  Note: Giphy API only provides CURRENT views, not historical data.")
+                        _log(f"  First time checking - fetching current views from Giphy API...")
+                        _log(f"  Note: Giphy API only provides CURRENT views, not historical data.")
                         
                         # Fetch current views (will be cached for next comparison)
                         api_result = fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=False)
                         
                         # If API didn't work or returned no views, fall back to scraping
                         if not api_result['success'] or api_result['fetched_count'] == 0:
-                            print(f"  API didn't return views, falling back to web scraping...")
+                            _log(f"  API didn't return views, falling back to web scraping...")
                             # Scrape views for all GIFs and cache them
                             gif_url_map = {gif.get('id'): gif.get('url') for gif in all_gifs_list if gif.get('id')}
                             gif_views_data = {'total_views': 0, 'gif_views': {}, 'fetched_count': 0, 'timestamp': datetime.now().isoformat()}
@@ -4298,24 +4681,24 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                                         gif_views_data['gif_views'][gif_id] = views
                                         gif_views_data['total_views'] += views
                                         gif_views_data['fetched_count'] += 1
-                                        print(f"    Scraped {gif_id[:12]}...: {views:,} views")
+                                        _log(f"    Scraped {gif_id[:12]}...: {views:,} views")
                                 except Exception as e:
-                                    print(f"    Error scraping {gif_id}: {str(e)}")
+                                    _log(f"    Error scraping {gif_id}: {str(e)}")
                                 time.sleep(0.5)  # Small delay
                             
                             # Cache the scraped views
                             if gif_views_data['fetched_count'] > 0:
                                 cache_views(channel_id, gif_views_data)
-                                print(f"  ✓ Cached {gif_views_data['fetched_count']} GIF views for next comparison")
+                                _log(f"  ✓ Cached {gif_views_data['fetched_count']} GIF views for next comparison")
                 except Exception as e:
-                    print(f"  ⚠️  Real-time comparison failed: {str(e)}")
-                    print(f"  Falling back to database storage method...")
+                    _log(f"  ⚠️  Real-time comparison failed: {str(e)}")
+                    _log(f"  Falling back to database storage method...")
                     
                     # Fallback: Store in database
                     api_result = fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=True)
                     
                     if not api_result['success'] or api_result['fetched_count'] == 0:
-                        print(f"  API didn't return views, falling back to web scraping...")
+                        _log(f"  API didn't return views, falling back to web scraping...")
                         gif_url_map = {gif.get('id'): gif.get('url') for gif in all_gifs_list if gif.get('id')}
                         
                         for gif_id in gif_ids:
@@ -4324,9 +4707,9 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                                 views = scrape_gif_views_with_proxy(gif_id, proxy=None, location='default', gif_url=gif_url)
                                 if views is not None:
                                     store_view_count(gif_id, views)
-                                    print(f"    Scraped {gif_id[:12]}...: {views:,} views")
+                                    _log(f"    Scraped {gif_id[:12]}...: {views:,} views")
                             except Exception as e:
-                                print(f"    Error scraping {gif_id}: {str(e)}")
+                                _log(f"    Error scraping {gif_id}: {str(e)}")
                             time.sleep(0.5)
             
             # Now analyze view trends (Today vs Yesterday)
@@ -4336,7 +4719,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
             # If no database history, try real-time cache comparison
             yesterday_data_available = view_trend_analysis.get('yesterday_data_available', False)
             if not yesterday_data_available and auto_check_views:
-                print(f"  No database history found. Trying real-time cache comparison...")
+                _log(f"  No database history found. Trying real-time cache comparison...")
                 try:
                     realtime_comparison = get_realtime_channel_views_comparison(channel_id, gif_ids)
                     
@@ -4366,10 +4749,10 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         if view_trend_analysis['gifs_with_views'] > 0:
                             view_trend_analysis['average_views'] = current_total / view_trend_analysis['gifs_with_views']
                         
-                        print(f"  ✓ Using real-time cache comparison (no database storage)")
-                        print(f"    Current: {current_total:,} | Previous: {previous_total:,} | Status: {status}")
+                        _log(f"  ✓ Using real-time cache comparison (no database storage)")
+                        # print(f"    Current: {current_total:,} | Previous: {previous_total:,} | Status: {status}")
                     else:
-                        print(f"  ⚠️  First time checking - no previous data in cache. Will compare on next check.")
+                        _log(f"  ⚠️  First time checking - no previous data in cache. Will compare on next check.")
                         # Update with current views from real-time fetch
                         current_total = realtime_comparison['current_views'].get('total_views', 0)
                         view_trend_analysis['total_views_today'] = current_total
@@ -4377,25 +4760,25 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         if view_trend_analysis['gifs_with_views'] > 0:
                             view_trend_analysis['average_views'] = current_total / view_trend_analysis['gifs_with_views']
                 except Exception as e:
-                    print(f"  ⚠️  Real-time comparison failed: {str(e)}")
+                    _log(f"  ⚠️  Real-time comparison failed: {str(e)}")
                     import traceback
                     traceback.print_exc()
             
-            print(f"View Trends Analysis (Real-time - 24h and 48h comparison):")
-            print(f"  Total GIFs: {view_trend_analysis['total_gifs']}")
-            print(f"  GIFs with views: {view_trend_analysis['gifs_with_views']}")
-            print(f"  Total views today: {view_trend_analysis['total_views_today']:,}")
-            print(f"  Total views 24h ago: {view_trend_analysis['total_views_yesterday']:,}")
+            _log(f"View Trends Analysis (Real-time - 24h and 48h comparison):")
+            # print(f"  Total GIFs: {view_trend_analysis['total_gifs']}")
+            _log(f"  GIFs with views: {view_trend_analysis['gifs_with_views']}")
+            _log(f"  Total views today: {view_trend_analysis['total_views_today']:,}")
+            _log(f"  Total views 24h ago: {view_trend_analysis['total_views_yesterday']:,}")
             if view_trend_analysis.get('total_views_48h_ago', 0) > 0:
-                print(f"  Total views 48h ago: {view_trend_analysis['total_views_48h_ago']:,}")
-            print(f"  Views difference (24h): {view_trend_analysis['views_difference']:+,}")
+                _log(f"  Total views 48h ago: {view_trend_analysis['total_views_48h_ago']:,}")
+            _log(f"  Views difference (24h): {view_trend_analysis['views_difference']:+,}")
             if view_trend_analysis.get('views_difference_48h', 0) != 0:
-                print(f"  Views difference (48h): {view_trend_analysis['views_difference_48h']:+,}")
-            print(f"  Overall trend: {view_trend_analysis['trend']}")
+                _log(f"  Views difference (48h): {view_trend_analysis['views_difference_48h']:+,}")
+            _log(f"  Overall trend: {view_trend_analysis['trend']}")
             if view_trend_analysis['gifs_with_views'] > 0:
-                print(f"  Average views: {view_trend_analysis['average_views']:,.0f}")
+                _log(f"  Average views: {view_trend_analysis['average_views']:,.0f}")
         except Exception as e:
-            print(f"Error analyzing view trends: {str(e)}")
+            _log(f"Error analyzing view trends: {str(e)}")
             view_trend_analysis = None
     
     # ANALYSIS BASED ON VIEW TRENDS (Today vs Yesterday) - SIMPLE LOGIC:
@@ -4418,24 +4801,24 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
         previous_timestamp = view_trend_analysis.get('previous_timestamp')
         
         # View comparison display (24h and 48h)
-        print(f"  View Comparison (Real-time):")
-        print(f"    Current views: {total_views_today:,}")
+        _log(f"  View Comparison (Real-time):")
+        _log(f"    Current views: {total_views_today:,}")
         if yesterday_data_available:
             if comparison_method == '24_hour':
-                print(f"    Previous views (24h ago): {total_views_yesterday:,}")
+                _log(f"    Previous views (24h ago): {total_views_yesterday:,}")
             else:
-                print(f"    Previous views (yesterday): {total_views_yesterday:,}")
-            print(f"    Difference (24h): {views_difference:+,} views")
+                _log(f"    Previous views (yesterday): {total_views_yesterday:,}")
+            _log(f"    Difference (24h): {views_difference:+,} views")
             
             # Show 48h comparison if available
             total_views_48h_ago = view_trend_analysis.get('total_views_48h_ago', 0)
             views_difference_48h = view_trend_analysis.get('views_difference_48h', 0)
             if total_views_48h_ago > 0:
-                print(f"    Previous views (48h ago): {total_views_48h_ago:,}")
-                print(f"    Difference (48h): {views_difference_48h:+,} views")
+                _log(f"    Previous views (48h ago): {total_views_48h_ago:,}")
+                _log(f"    Difference (48h): {views_difference_48h:+,} views")
         else:
-            print(f"    Previous views: Not available")
-            print(f"    ⚠️  Need previous data to compare")
+            _log(f"    Previous views: Not available")
+            _log(f"    ⚠️  Need previous data to compare")
         
         # DECISION LOGIC: 
         # - BANNED: Channel not found in search results (handled earlier)
@@ -4454,7 +4837,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                 analysis['banned'] = False
                 analysis['status'] = 'shadow_banned'
                 analysis['analysis_reasons'].append(f'Channel has {total_uploads} uploads but NO views tracked. Endpoint 404 + view scraping failed - CANNOT VERIFY views are increasing. Shadow banned = views NOT increasing - SHADOW BANNED')
-                print(f"  👻 SHADOW BANNED: No views tracked - cannot verify views are increasing (shadow banned = views NOT increasing)")
+                _log(f"  👻 SHADOW BANNED: No views tracked - cannot verify views are increasing (shadow banned = views NOT increasing)")
             else:
                 # No views but context unclear - still shadow banned
                 analysis['shadow_banned'] = True
@@ -4462,7 +4845,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                 analysis['banned'] = False
                 analysis['status'] = 'shadow_banned'
                 analysis['analysis_reasons'].append(f'Channel has {total_uploads} uploads but NO views tracked. Cannot verify views are increasing - SHADOW BANNED (shadow banned = views NOT increasing)')
-                print(f"  👻 SHADOW BANNED: No views tracked - cannot verify views are increasing")
+                _log(f"  👻 SHADOW BANNED: No views tracked - cannot verify views are increasing")
         elif gifs_with_views > 0:
             # VIEW-BASED LOGIC: Compare total view counts and check magnitude of increase
             # - WORKING: Views increasing in K-M range (thousands to millions)
@@ -4476,10 +4859,10 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                 analysis['shadow_banned'] = False
                 analysis['banned'] = False
                 analysis['analysis_reasons'].append(f'Current views: {total_views_today:,} | Previous views: Not available | Status: Cannot determine (need previous data)')
-                print(f"  ⚠️  STATUS: UNKNOWN")
-                print(f"     Current views: {total_views_today:,}")
-                print(f"     Previous views: Not available")
-                print(f"     Action: Run check again tomorrow to compare")
+                _log(f"  ⚠️  STATUS: UNKNOWN")
+                _log(f"     Current views: {total_views_today:,}")
+                _log(f"     Previous views: Not available")
+                _log(f"     Action: Run check again tomorrow to compare")
             elif total_views_today > total_views_yesterday or trend == 'increasing_48h':
                 # Views are increasing (24h or 48h) - check magnitude to determine if WORKING or SHADOW BANNED
                 # SHADOW BANNED: Views increasing by very little (15-20 count per day)
@@ -4494,7 +4877,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                     base_views = total_views_48h_ago
                     absolute_increase = views_difference_48h
                     time_period = "48h"
-                    print(f"    Using 48h trend for real-time detection (24h stagnant, 48h shows growth)")
+                    _log(f"    Using 48h trend for real-time detection (24h stagnant, 48h shows growth)")
                 else:
                     # Use 24-hour comparison
                     base_views = total_views_yesterday
@@ -4528,16 +4911,16 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['banned'] = False
                         if use_48h_trend:
                             analysis['analysis_reasons'].append(f'✅ WORKING: Views increased over 48h from {prev_views_display:,} to {total_views_today:,} (+{change_display:,} views, {percentage_increase:+.2f}%) - significant increase in K-M range (real-time detection)')
-                            print(f"  ✅ STATUS: WORKING (Real-time - 48h trend)")
-                            print(f"     Current views: {total_views_today:,}")
-                            print(f"     Previous views (48h ago): {prev_views_display:,}")
-                            print(f"     Change (48h): +{change_display:,} views ({percentage_increase:+.2f}%) - SIGNIFICANT INCREASE (K-M range)")
+                            _log(f"  ✅ STATUS: WORKING (Real-time - 48h trend)")
+                            _log(f"     Current views: {total_views_today:,}")
+                            _log(f"     Previous views (48h ago): {prev_views_display:,}")
+                            _log(f"     Change (48h): +{change_display:,} views ({percentage_increase:+.2f}%) - SIGNIFICANT INCREASE (K-M range)")
                         else:
                             analysis['analysis_reasons'].append(f'✅ WORKING: Views increased from {prev_views_display:,} to {total_views_today:,} (+{change_display:,} views, {percentage_increase:+.2f}%) - significant increase in K-M range')
-                            print(f"  ✅ STATUS: WORKING")
-                            print(f"     Current views: {total_views_today:,}")
-                            print(f"     Previous views (24h ago): {prev_views_display:,}")
-                            print(f"     Change (24h): +{change_display:,} views ({percentage_increase:+.2f}%) - SIGNIFICANT INCREASE (K-M range)")
+                            _log(f"  ✅ STATUS: WORKING")
+                            _log(f"     Current views: {total_views_today:,}")
+                            _log(f"     Previous views (24h ago): {prev_views_display:,}")
+                            _log(f"     Change (24h): +{change_display:,} views ({percentage_increase:+.2f}%) - SIGNIFICANT INCREASE (K-M range)")
                     elif absolute_increase <= SHADOW_BAN_THRESHOLD:
                         # SHADOW BANNED: Very small increase (15-20 count range)
                         analysis['shadow_banned'] = True
@@ -4545,10 +4928,10 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['banned'] = False
                         analysis['status'] = 'shadow_banned'
                         analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Views increased by only {views_difference:,} views ({percentage_increase:+.2f}%) from {total_views_yesterday:,} to {total_views_today:,} - very small increase (15-20 count range)')
-                        print(f"  👻 STATUS: SHADOW BANNED")
-                        print(f"     Current views: {total_views_today:,}")
-                        print(f"     Previous views: {total_views_yesterday:,}")
-                        print(f"     Change: +{views_difference:,} views ({percentage_increase:+.2f}%) - VERY SMALL INCREASE (15-20 count range)")
+                        _log(f"  👻 STATUS: SHADOW BANNED")
+                        _log(f"     Current views: {total_views_today:,}")
+                        _log(f"     Previous views: {total_views_yesterday:,}")
+                        _log(f"     Change: +{views_difference:,} views ({percentage_increase:+.2f}%) - VERY SMALL INCREASE (15-20 count range)")
                     else:
                         # Medium increase (50-1000 views) - could be either, but conservative = shadow banned
                         analysis['shadow_banned'] = True
@@ -4556,10 +4939,10 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['banned'] = False
                         analysis['status'] = 'shadow_banned'
                         analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Views increased by {views_difference:,} views ({percentage_increase:+.2f}%) from {total_views_yesterday:,} to {total_views_today:,} - moderate increase but not in K-M range')
-                        print(f"  👻 STATUS: SHADOW BANNED")
-                        print(f"     Current views: {total_views_today:,}")
-                        print(f"     Previous views: {total_views_yesterday:,}")
-                        print(f"     Change: +{views_difference:,} views ({percentage_increase:+.2f}%) - MODERATE INCREASE (not in K-M range)")
+                        _log(f"  👻 STATUS: SHADOW BANNED")
+                        _log(f"     Current views: {total_views_today:,}")
+                        _log(f"     Previous views: {total_views_yesterday:,}")
+                        _log(f"     Change: +{views_difference:,} views ({percentage_increase:+.2f}%) - MODERATE INCREASE (not in K-M range)")
                 else:
                     # For smaller channels, use absolute threshold
                     prev_views_display = base_views
@@ -4570,16 +4953,16 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         # Will combine with search visibility below
                         if use_48h_trend:
                             analysis['analysis_reasons'].append(f'✅ WORKING: Views increased over 48h from {prev_views_display:,} to {total_views_today:,} (+{change_display:,} views, {percentage_increase:+.2f}%) - significant increase in K-M range (real-time detection)')
-                            print(f"  ✅ STATUS: WORKING (Real-time - 48h trend)")
-                            print(f"     Current views: {total_views_today:,}")
-                            print(f"     Previous views (48h ago): {prev_views_display:,}")
-                            print(f"     Change (48h): +{change_display:,} views ({percentage_increase:+.2f}%) - SIGNIFICANT INCREASE (K-M range)")
+                            _log(f"  ✅ STATUS: WORKING (Real-time - 48h trend)")
+                            _log(f"     Current views: {total_views_today:,}")
+                            _log(f"     Previous views (48h ago): {prev_views_display:,}")
+                            _log(f"     Change (48h): +{change_display:,} views ({percentage_increase:+.2f}%) - SIGNIFICANT INCREASE (K-M range)")
                         else:
                             analysis['analysis_reasons'].append(f'✅ WORKING: Views increased from {prev_views_display:,} to {total_views_today:,} (+{change_display:,} views, {percentage_increase:+.2f}%) - significant increase in K-M range')
-                            print(f"  ✅ STATUS: WORKING")
-                            print(f"     Current views: {total_views_today:,}")
-                            print(f"     Previous views (24h ago): {prev_views_display:,}")
-                            print(f"     Change (24h): +{change_display:,} views ({percentage_increase:+.2f}%) - SIGNIFICANT INCREASE (K-M range)")
+                            _log(f"  ✅ STATUS: WORKING")
+                            _log(f"     Current views: {total_views_today:,}")
+                            _log(f"     Previous views (24h ago): {prev_views_display:,}")
+                            _log(f"     Change (24h): +{change_display:,} views ({percentage_increase:+.2f}%) - SIGNIFICANT INCREASE (K-M range)")
                     elif absolute_increase <= SHADOW_BAN_THRESHOLD:
                         # SHADOW BANNED: Very small increase (15-20 count range)
                         analysis['shadow_banned'] = True
@@ -4587,10 +4970,10 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['banned'] = False
                         analysis['status'] = 'shadow_banned'
                         analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Views increased by only {views_difference:,} views ({percentage_increase:+.2f}%) from {total_views_yesterday:,} to {total_views_today:,} - very small increase (15-20 count range)')
-                        print(f"  👻 STATUS: SHADOW BANNED")
-                        print(f"     Current views: {total_views_today:,}")
-                        print(f"     Previous views: {total_views_yesterday:,}")
-                        print(f"     Change: +{views_difference:,} views ({percentage_increase:+.2f}%) - VERY SMALL INCREASE (15-20 count range)")
+                        _log(f"  👻 STATUS: SHADOW BANNED")
+                        _log(f"     Current views: {total_views_today:,}")
+                        _log(f"     Previous views: {total_views_yesterday:,}")
+                        _log(f"     Change: +{views_difference:,} views ({percentage_increase:+.2f}%) - VERY SMALL INCREASE (15-20 count range)")
                     else:
                         # Medium increase (50-1000 views) - conservative = shadow banned if not clearly working
                         if percentage_increase >= 5.0:  # 5%+ increase is significant for smaller channels
@@ -4603,10 +4986,10 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                             analysis['banned'] = False
                             analysis['status'] = 'shadow_banned'
                             analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Views increased by {views_difference:,} views ({percentage_increase:+.2f}%) from {total_views_yesterday:,} to {total_views_today:,} - moderate increase but not in K-M range')
-                            print(f"  👻 STATUS: SHADOW BANNED")
-                            print(f"     Current views: {total_views_today:,}")
-                            print(f"     Previous views: {total_views_yesterday:,}")
-                            print(f"     Change: +{views_difference:,} views ({percentage_increase:+.2f}%) - MODERATE INCREASE (not in K-M range)")
+                            _log(f"  👻 STATUS: SHADOW BANNED")
+                            _log(f"     Current views: {total_views_today:,}")
+                            _log(f"     Previous views: {total_views_yesterday:,}")
+                            _log(f"     Change: +{views_difference:,} views ({percentage_increase:+.2f}%) - MODERATE INCREASE (not in K-M range)")
             else:
                 # Check if 48h trend shows growth (real-time detection for slow-growing channels)
                 total_views_48h_ago = view_trend_analysis.get('total_views_48h_ago', 0)
@@ -4625,11 +5008,11 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['shadow_banned'] = False
                         analysis['banned'] = False
                         analysis['analysis_reasons'].append(f'✅ WORKING: Views increased over 48h from {total_views_48h_ago:,} to {total_views_today:,} (+{views_difference_48h:,} views, {percentage_increase_48h:+.2f}%) - significant increase detected via 48h trend (real-time)')
-                        print(f"  ✅ STATUS: WORKING (Real-time - 48h trend shows growth)")
-                        print(f"     Current views: {total_views_today:,}")
-                        print(f"     Previous views (48h ago): {total_views_48h_ago:,}")
-                        print(f"     Change (48h): +{views_difference_48h:,} views ({percentage_increase_48h:+.2f}%) - SIGNIFICANT INCREASE (K-M range)")
-                        print(f"     Note: 24h comparison shows {views_difference:+,} views, but 48h trend indicates growth")
+                        _log(f"  ✅ STATUS: WORKING (Real-time - 48h trend shows growth)")
+                        _log(f"     Current views: {total_views_today:,}")
+                        _log(f"     Previous views (48h ago): {total_views_48h_ago:,}")
+                        _log(f"     Change (48h): +{views_difference_48h:,} views ({percentage_increase_48h:+.2f}%) - SIGNIFICANT INCREASE (K-M range)")
+                        _log(f"     Note: 24h comparison shows {views_difference:+,} views, but 48h trend indicates growth")
                     elif views_difference_48h <= SHADOW_BAN_THRESHOLD_48H:
                         # SHADOW BANNED: 48h shows very small growth
                         analysis['shadow_banned'] = True
@@ -4637,10 +5020,10 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['banned'] = False
                         analysis['status'] = 'shadow_banned'
                         analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Views increased by only {views_difference_48h:,} views over 48h ({percentage_increase_48h:+.2f}%) - very small increase (15-20 count range)')
-                        print(f"  👻 STATUS: SHADOW BANNED")
-                        print(f"     Current views: {total_views_today:,}")
-                        print(f"     Previous views (48h ago): {total_views_48h_ago:,}")
-                        print(f"     Change (48h): +{views_difference_48h:,} views ({percentage_increase_48h:+.2f}%) - VERY SMALL INCREASE")
+                        _log(f"  👻 STATUS: SHADOW BANNED")
+                        _log(f"     Current views: {total_views_today:,}")
+                        _log(f"     Previous views (48h ago): {total_views_48h_ago:,}")
+                        _log(f"     Change (48h): +{views_difference_48h:,} views ({percentage_increase_48h:+.2f}%) - VERY SMALL INCREASE")
                     else:
                         # Medium 48h growth - conservative = shadow banned
                         analysis['shadow_banned'] = True
@@ -4648,10 +5031,10 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['banned'] = False
                         analysis['status'] = 'shadow_banned'
                         analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Views increased by {views_difference_48h:,} views over 48h ({percentage_increase_48h:+.2f}%) - moderate increase but not in K-M range')
-                        print(f"  👻 STATUS: SHADOW BANNED")
-                        print(f"     Current views: {total_views_today:,}")
-                        print(f"     Previous views (48h ago): {total_views_48h_ago:,}")
-                        print(f"     Change (48h): +{views_difference_48h:,} views ({percentage_increase_48h:+.2f}%) - MODERATE INCREASE (not in K-M range)")
+                        _log(f"  👻 STATUS: SHADOW BANNED")
+                        _log(f"     Current views: {total_views_today:,}")
+                        _log(f"     Previous views (48h ago): {total_views_48h_ago:,}")
+                        _log(f"     Change (48h): +{views_difference_48h:,} views ({percentage_increase_48h:+.2f}%) - MODERATE INCREASE (not in K-M range)")
                 else:
                     # Check if this is a very large channel (10M+ views) - be more lenient
                     # Large channels with millions of views are clearly working, even if views appear stagnant
@@ -4665,24 +5048,24 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['banned'] = False
                         if total_views_today == total_views_yesterday:
                             analysis['analysis_reasons'].append(f'✅ WORKING: Very large channel ({total_views_today:,} views) - views appear stagnant over short period but channel has millions of views (clearly working)')
-                            print(f"  ✅ STATUS: WORKING")
-                            print(f"     Current views: {total_views_today:,}")
-                            print(f"     Previous views (24h ago): {total_views_yesterday:,}")
-                            print(f"     Change (24h): {views_difference:,} views")
-                            print(f"     Note: Very large channel (10M+ views) - clearly working even if views appear stagnant")
+                            _log(f"  ✅ STATUS: WORKING")
+                            _log(f"     Current views: {total_views_today:,}")
+                            _log(f"     Previous views (24h ago): {total_views_yesterday:,}")
+                            _log(f"     Change (24h): {views_difference:,} views")
+                            _log(f"     Note: Very large channel (10M+ views) - clearly working even if views appear stagnant")
                             if total_views_48h_ago > 0:
-                                print(f"     Previous views (48h ago): {total_views_48h_ago:,}")
-                                print(f"     Change (48h): {views_difference_48h:,} views")
+                                _log(f"     Previous views (48h ago): {total_views_48h_ago:,}")
+                                _log(f"     Change (48h): {views_difference_48h:,} views")
                         else:
                             analysis['analysis_reasons'].append(f'✅ WORKING: Very large channel ({total_views_today:,} views) - slight decrease over short period but channel has millions of views (clearly working)')
-                            print(f"  ✅ STATUS: WORKING")
-                            print(f"     Current views: {total_views_today:,}")
-                            print(f"     Previous views (24h ago): {total_views_yesterday:,}")
-                            print(f"     Change (24h): {views_difference:,} views")
-                            print(f"     Note: Very large channel (10M+ views) - clearly working despite slight variation")
+                            _log(f"  ✅ STATUS: WORKING")
+                            _log(f"     Current views: {total_views_today:,}")
+                            _log(f"     Previous views (24h ago): {total_views_yesterday:,}")
+                            _log(f"     Change (24h): {views_difference:,} views")
+                            _log(f"     Note: Very large channel (10M+ views) - clearly working despite slight variation")
                             if total_views_48h_ago > 0:
-                                print(f"     Previous views (48h ago): {total_views_48h_ago:,}")
-                                print(f"     Change (48h): {views_difference_48h:,} views")
+                                _log(f"     Previous views (48h ago): {total_views_48h_ago:,}")
+                                _log(f"     Change (48h): {views_difference_48h:,} views")
                     else:
                         # Check if views are STAGNANT (not increasing) vs DECREASING
                         # SHADOW BANNED: Views STAGNANT (no change or very small increase 15-20)
@@ -4694,13 +5077,13 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                             analysis['banned'] = False
                             analysis['status'] = 'shadow_banned'
                             analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Views stagnant at {total_views_today:,} (not increasing over 24h or 48h)')
-                            print(f"  👻 STATUS: SHADOW BANNED")
-                            print(f"     Current views: {total_views_today:,}")
-                            print(f"     Previous views (24h ago): {total_views_yesterday:,}")
-                            print(f"     Change (24h): {views_difference:,} views (STAGNANT - not increasing)")
+                            _log(f"  👻 STATUS: SHADOW BANNED")
+                            _log(f"     Current views: {total_views_today:,}")
+                            _log(f"     Previous views (24h ago): {total_views_yesterday:,}")
+                            _log(f"     Change (24h): {views_difference:,} views (STAGNANT - not increasing)")
                             if total_views_48h_ago > 0:
-                                print(f"     Previous views (48h ago): {total_views_48h_ago:,}")
-                                print(f"     Change (48h): {views_difference_48h:,} views")
+                                _log(f"     Previous views (48h ago): {total_views_48h_ago:,}")
+                                _log(f"     Change (48h): {views_difference_48h:,} views")
                         elif views_difference < 0:
                             # DECREASING: Views decreased - this is normal fluctuation, still WORKING
                             # Don't mark as shadow banned just because views decreased
@@ -4709,14 +5092,14 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                             analysis['shadow_banned'] = False
                             analysis['banned'] = False
                             analysis['analysis_reasons'].append(f'✅ WORKING: Views decreased from {total_views_yesterday:,} to {total_views_today:,} ({views_difference:,} views) - normal fluctuation, channel still working')
-                            print(f"  ✅ STATUS: WORKING")
-                            print(f"     Current views: {total_views_today:,}")
-                            print(f"     Previous views (24h ago): {total_views_yesterday:,}")
-                            print(f"     Change (24h): {views_difference:,} views (DECREASING - normal fluctuation)")
-                            print(f"     Note: Decreasing views is normal - channel is still working")
+                            _log(f"  ✅ STATUS: WORKING")
+                            _log(f"     Current views: {total_views_today:,}")
+                            _log(f"     Previous views (24h ago): {total_views_yesterday:,}")
+                            _log(f"     Change (24h): {views_difference:,} views (DECREASING - normal fluctuation)")
+                            _log(f"     Note: Decreasing views is normal - channel is still working")
                             if total_views_48h_ago > 0:
-                                print(f"     Previous views (48h ago): {total_views_48h_ago:,}")
-                                print(f"     Change (48h): {views_difference_48h:,} views")
+                                _log(f"     Previous views (48h ago): {total_views_48h_ago:,}")
+                                _log(f"     Change (48h): {views_difference_48h:,} views")
                         else:
                             # Small positive increase but not significant - check if it's in shadow ban range (15-20)
                             if views_difference <= 50:  # Very small increase (15-50 views) = shadow banned
@@ -4725,10 +5108,10 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                                 analysis['banned'] = False
                                 analysis['status'] = 'shadow_banned'
                                 analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Views increased by only {views_difference:,} views from {total_views_yesterday:,} to {total_views_today:,} - very small increase (15-20 count range)')
-                                print(f"  👻 STATUS: SHADOW BANNED")
-                                print(f"     Current views: {total_views_today:,}")
-                                print(f"     Previous views (24h ago): {total_views_yesterday:,}")
-                                print(f"     Change (24h): +{views_difference:,} views (VERY SMALL INCREASE - shadow banned range)")
+                                _log(f"  👻 STATUS: SHADOW BANNED")
+                                _log(f"     Current views: {total_views_today:,}")
+                                _log(f"     Previous views (24h ago): {total_views_yesterday:,}")
+                                _log(f"     Change (24h): +{views_difference:,} views (VERY SMALL INCREASE - shadow banned range)")
                             else:
                                 # Moderate increase - still working
                                 analysis['working'] = True
@@ -4736,10 +5119,10 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                                 analysis['shadow_banned'] = False
                                 analysis['banned'] = False
                                 analysis['analysis_reasons'].append(f'✅ WORKING: Views increased from {total_views_yesterday:,} to {total_views_today:,} (+{views_difference:,} views) - channel working')
-                                print(f"  ✅ STATUS: WORKING")
-                                print(f"     Current views: {total_views_today:,}")
-                                print(f"     Previous views (24h ago): {total_views_yesterday:,}")
-                                print(f"     Change (24h): +{views_difference:,} views")
+                                _log(f"  ✅ STATUS: WORKING")
+                                _log(f"     Current views: {total_views_today:,}")
+                                _log(f"     Previous views (24h ago): {total_views_yesterday:,}")
+                                _log(f"     Change (24h): +{views_difference:,} views")
             
             # Legacy check for no views (shouldn't happen if we have gifs_with_views > 0)
             no_views_percent = ((total_gifs - gifs_with_views) / total_gifs) * 100 if total_gifs > 0 else 0
@@ -4750,7 +5133,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                 analysis['banned'] = False
                 analysis['status'] = 'shadow_banned'
                 analysis['analysis_reasons'].append(f'{total_gifs - gifs_with_views}/{total_gifs} GIFs ({no_views_percent:.1f}%) have NO views over last 2 days - SHADOW BANNED')
-                print(f"  👻 SHADOW BANNED: {no_views_percent:.1f}% of GIFs have no views")
+                _log(f"  👻 SHADOW BANNED: {no_views_percent:.1f}% of GIFs have no views")
         else:
             # No views at all - Check accessibility and upload count before deciding
             # If GIFs are accessible and channel has many uploads, likely working even if views can't be tracked
@@ -4773,13 +5156,13 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                 analysis['banned'] = False
                 if scraping_attempted:
                     analysis['analysis_reasons'].append(f'✅ WORKING: Channel has {total_uploads} uploads with {accessible_gifs_count} GIFs accessible via detail endpoint ({accessibility_ratio*100:.1f}%). View scraping failed but channel appears active - WORKING')
-                    print(f"  ✅ STATUS: WORKING")
-                    print(f"     Channel has {total_uploads} uploads with {accessible_gifs_count} accessible GIFs ({accessibility_ratio*100:.1f}%)")
-                    print(f"     View scraping failed but channel appears active (many uploads + accessible GIFs)")
+                    _log(f"  ✅ STATUS: WORKING")
+                    _log(f"     Channel has {total_uploads} uploads with {accessible_gifs_count} accessible GIFs ({accessibility_ratio*100:.1f}%)")
+                    _log(f"     View scraping failed but channel appears active (many uploads + accessible GIFs)")
                 else:
                     analysis['analysis_reasons'].append(f'✅ WORKING: Channel has {total_uploads} uploads with {accessible_gifs_count} GIFs accessible ({accessibility_ratio*100:.1f}%) - channel appears active')
-                    print(f"  ✅ STATUS: WORKING")
-                    print(f"     Channel has {total_uploads} uploads with {accessible_gifs_count} accessible GIFs ({accessibility_ratio*100:.1f}%)")
+                    _log(f"  ✅ STATUS: WORKING")
+                    _log(f"     Channel has {total_uploads} uploads with {accessible_gifs_count} accessible GIFs ({accessibility_ratio*100:.1f}%)")
             elif accessible_gifs_count > 0 and accessibility_ratio >= GOOD_ACCESSIBILITY_THRESHOLD:
                 # Good accessibility ratio (50%+) - likely WORKING
                 analysis['working'] = True
@@ -4787,8 +5170,8 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                 analysis['shadow_banned'] = False
                 analysis['banned'] = False
                 analysis['analysis_reasons'].append(f'✅ WORKING: Channel has {accessible_gifs_count}/{total_uploads} GIFs accessible ({accessibility_ratio*100:.1f}%) - good accessibility indicates channel is working')
-                print(f"  ✅ STATUS: WORKING")
-                print(f"     {accessible_gifs_count}/{total_uploads} GIFs accessible ({accessibility_ratio*100:.1f}%) - good accessibility")
+                _log(f"  ✅ STATUS: WORKING")
+                _log(f"     {accessible_gifs_count}/{total_uploads} GIFs accessible ({accessibility_ratio*100:.1f}%) - good accessibility")
             elif scraping_attempted:
                 # Scraping attempted but failed - check context
                 if user_id and gifs_endpoint_404:
@@ -4799,7 +5182,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['banned'] = False
                         analysis['status'] = 'shadow_banned'
                         analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Channel has {total_uploads} uploads but only {accessible_gifs_count} GIFs accessible ({accessibility_ratio*100:.1f}%). User endpoint 404 and view scraping failed - SHADOW BANNED')
-                        print(f"  👻 SHADOW BANNED: Endpoint 404 + low accessibility ({accessibility_ratio*100:.1f}%) + view scraping failed")
+                        _log(f"  👻 SHADOW BANNED: Endpoint 404 + low accessibility ({accessibility_ratio*100:.1f}%) + view scraping failed")
                     else:
                         # Some accessibility - mark as unknown
                         analysis['status'] = 'unknown'
@@ -4807,7 +5190,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['shadow_banned'] = False
                         analysis['banned'] = False
                         analysis['analysis_reasons'].append(f'⚠️  UNKNOWN: Channel has {total_uploads} uploads with {accessible_gifs_count} GIFs accessible ({accessibility_ratio*100:.1f}%). Endpoint 404 and view scraping failed - cannot determine status')
-                        print(f"  ⚠️  UNKNOWN: Endpoint 404 + some accessibility ({accessibility_ratio*100:.1f}%) + view scraping failed")
+                        _log(f"  ⚠️  UNKNOWN: Endpoint 404 + some accessibility ({accessibility_ratio*100:.1f}%) + view scraping failed")
                 else:
                     # Endpoint works but views can't be scraped - mark as unknown
                     analysis['status'] = 'unknown'
@@ -4815,7 +5198,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                     analysis['shadow_banned'] = False
                     analysis['banned'] = False
                     analysis['analysis_reasons'].append(f'⚠️  UNKNOWN: Channel accessible but view scraping failed. Cannot determine if views are increasing - need view data for accurate status')
-                    print(f"  ⚠️  UNKNOWN: View scraping failed - cannot verify views are increasing")
+                    _log(f"  ⚠️  UNKNOWN: View scraping failed - cannot verify views are increasing")
             else:
                 # No view data yet (not attempted) - need data collection
                 # But if channel has many uploads and GIFs are accessible, likely working
@@ -4825,12 +5208,12 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                     analysis['shadow_banned'] = False
                     analysis['banned'] = False
                     analysis['analysis_reasons'].append(f'✅ WORKING: Channel has {total_uploads} uploads with {accessible_gifs_count} accessible GIFs ({accessibility_ratio*100:.1f}%) - appears active (view tracking not yet started)')
-                    print(f"  ✅ STATUS: WORKING")
-                    print(f"     Channel has {total_uploads} uploads with {accessible_gifs_count} accessible GIFs ({accessibility_ratio*100:.1f}%)")
-                    print(f"     View tracking not yet started, but channel appears active")
+                    _log(f"  ✅ STATUS: WORKING")
+                    _log(f"     Channel has {total_uploads} uploads with {accessible_gifs_count} accessible GIFs ({accessibility_ratio*100:.1f}%)")
+                    _log(f"     View tracking not yet started, but channel appears active")
                 else:
                     # No view data - try alternative detection methods
-                    print(f"  ⚠️  No view data available - trying alternative detection methods...")
+                    _log(f"  ⚠️  No view data available - trying alternative detection methods...")
                     
                     # Use alternative methods as fallback
                     gif_ids = [gif.get('id') for gif in all_gifs_list if gif.get('id')]
@@ -4839,7 +5222,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         try:
                             alternative_analysis = alternative_detection_methods.comprehensive_alternative_analysis(channel_id, all_gifs_list, gif_ids)
                         except Exception as e:
-                            print(f"  ⚠️  Alternative methods error: {str(e)}")
+                            _log(f"  ⚠️  Alternative methods error: {str(e)}")
                             alternative_analysis = None
                     
                     if alternative_analysis and alternative_analysis.get('alternative_status') != 'unknown':
@@ -4863,31 +5246,31 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                                 reasons.append(f"Good search visibility ({alternative_analysis.get('general_search', {}).get('visibility_rate', 0):.1f}%)")
                             
                             analysis['analysis_reasons'].append(f'✅ WORKING: Alternative methods indicate working channel (score: {composite_score}/100). ' + ', '.join(reasons))
-                            print(f"  ✅ STATUS: WORKING (Alternative methods - score: {composite_score}/100)")
-                            print(f"     Recent activity: {alternative_analysis.get('recent_activity', {}).get('activity_status', 'unknown')}")
-                            print(f"     Trending GIFs: {alternative_analysis.get('trending_status', {}).get('has_trending_gifs', False)}")
-                            print(f"     Search visibility: {alternative_analysis.get('general_search', {}).get('visibility_rate', 0):.1f}%")
+                            _log(f"  ✅ STATUS: WORKING (Alternative methods - score: {composite_score}/100)")
+                            _log(f"     Recent activity: {alternative_analysis.get('recent_activity', {}).get('activity_status', 'unknown')}")
+                            _log(f"     Trending GIFs: {alternative_analysis.get('trending_status', {}).get('has_trending_gifs', False)}")
+                            _log(f"     Search visibility: {alternative_analysis.get('general_search', {}).get('visibility_rate', 0):.1f}%")
                         elif alt_status == 'shadow_banned' and composite_score <= 0:
                             analysis['shadow_banned'] = True
                             analysis['working'] = False
                             analysis['status'] = 'shadow_banned'
                             analysis['banned'] = False
                             analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Alternative methods indicate shadow banned (score: {composite_score}/100)')
-                            print(f"  👻 STATUS: SHADOW BANNED (Alternative methods - score: {composite_score}/100)")
+                            _log(f"  👻 STATUS: SHADOW BANNED (Alternative methods - score: {composite_score}/100)")
                         else:
                             analysis['status'] = 'unknown'
                             analysis['working'] = False
                             analysis['shadow_banned'] = False
                             analysis['banned'] = False
                             analysis['analysis_reasons'].append(f'⚠️  UNKNOWN: Alternative methods inconclusive (score: {composite_score}/100). Need view data for accurate status')
-                            print(f"  ⚠️  UNKNOWN: Alternative methods inconclusive (score: {composite_score}/100)")
+                            _log(f"  ⚠️  UNKNOWN: Alternative methods inconclusive (score: {composite_score}/100)")
                     else:
                         analysis['status'] = 'unknown'
                         analysis['working'] = False
                         analysis['shadow_banned'] = False
                         analysis['banned'] = False
                         analysis['analysis_reasons'].append(f'⚠️  UNKNOWN: Channel accessible but no view data collected yet. Need to collect views over 2 days to verify if views are increasing')
-                        print(f"  ⚠️  UNKNOWN: No view data - need 2 days of tracking to verify views are increasing")
+                        _log(f"  ⚠️  UNKNOWN: No view data - need 2 days of tracking to verify views are increasing")
     else:
         # No view trend data available - cannot determine accurately
         # Check if we attempted scraping but failed
@@ -4904,7 +5287,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                 accessible_ratio = 0
                 if gifs_accessible_via_detail is not None:
                     accessible_ratio = (gifs_accessible_via_detail / total_uploads) if total_uploads > 0 else 0
-                    print(f"  GIF accessibility check: {gifs_accessible_via_detail}/{total_uploads} GIFs accessible via detail endpoint ({accessible_ratio*100:.1f}%)")
+                    _log(f"  GIF accessibility check: {gifs_accessible_via_detail}/{total_uploads} GIFs accessible via detail endpoint ({accessible_ratio*100:.1f}%)")
                 
                 # Decision logic when endpoint 404 but we have other indicators
                 if gifs_accessible_via_detail is not None and gifs_accessible_via_detail > 0:
@@ -4923,26 +5306,26 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['shadow_banned'] = False
                         analysis['banned'] = False
                         analysis['analysis_reasons'].append(f'✅ WORKING: Channel has {total_uploads} uploads with {accessible_gifs_count} GIFs accessible ({accessible_ratio*100:.1f}%). Endpoint 404 and view scraping failed, but channel appears active - WORKING')
-                        print(f"  ✅ WORKING: {total_uploads} uploads + {accessible_gifs_count} accessible GIFs ({accessible_ratio*100:.1f}%) - channel appears active")
+                        _log(f"  ✅ WORKING: {total_uploads} uploads + {accessible_gifs_count} accessible GIFs ({accessible_ratio*100:.1f}%) - channel appears active")
                     elif accessible_ratio >= 0.5:  # 50%+ accessible = WORKING
                         analysis['working'] = True
                         analysis['status'] = 'working'
                         analysis['shadow_banned'] = False
                         analysis['banned'] = False
                         analysis['analysis_reasons'].append(f'Channel has {gifs_accessible_via_detail}/{total_uploads} GIFs accessible ({accessible_ratio*100:.1f}%). User endpoint 404 but content accessible - WORKING (need view data for confirmation)')
-                        print(f"  ✅ WORKING: {accessible_ratio*100:.1f}% of GIFs accessible - need view data to confirm")
+                        _log(f"  ✅ WORKING: {accessible_ratio*100:.1f}% of GIFs accessible - need view data to confirm")
                     elif accessible_ratio >= 0.3:  # 30-50% accessible = uncertain
                         analysis['status'] = 'unknown'
                         analysis['working'] = False
                         analysis['shadow_banned'] = False
                         analysis['analysis_reasons'].append(f'Channel has {gifs_accessible_via_detail}/{total_uploads} GIFs accessible ({accessible_ratio*100:.1f}%). Mixed signals - need view data for accurate status')
-                        print(f"  ⚠️  UNKNOWN: {accessible_ratio*100:.1f}% accessible - mixed signals")
+                        _log(f"  ⚠️  UNKNOWN: {accessible_ratio*100:.1f}% accessible - mixed signals")
                     else:  # <30% accessible = likely shadow banned
                         analysis['shadow_banned'] = True
                         analysis['working'] = False
                         analysis['status'] = 'shadow_banned'
                         analysis['analysis_reasons'].append(f'Channel has only {gifs_accessible_via_detail}/{total_uploads} GIFs accessible ({accessible_ratio*100:.1f}%). User endpoint 404 and most GIFs not accessible - SHADOW BANNED')
-                        print(f"  👻 SHADOW BANNED: Only {accessible_ratio*100:.1f}% accessible")
+                        _log(f"  👻 SHADOW BANNED: Only {accessible_ratio*100:.1f}% accessible")
                 else:
                     # No accessibility data - check upload count
                     MANY_UPLOADS_THRESHOLD = 50  # Channels with 50+ uploads are likely working
@@ -4953,17 +5336,17 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['shadow_banned'] = False
                         analysis['banned'] = False
                         analysis['analysis_reasons'].append(f'✅ WORKING: Channel has {total_uploads} uploads. Endpoint 404 but channel appears active - WORKING')
-                        print(f"  ✅ WORKING: {total_uploads} uploads - channel appears active")
+                        _log(f"  ✅ WORKING: {total_uploads} uploads - channel appears active")
                     elif scraping_failed:
                         # Try alternative methods before marking as shadow banned
-                        print(f"  ⚠️  View scraping failed - trying alternative detection methods...")
+                        _log(f"  ⚠️  View scraping failed - trying alternative detection methods...")
                         gif_ids = [gif.get('id') for gif in all_gifs_list if gif.get('id')] if all_gifs_list else []
                         alternative_analysis = None
                         if ALTERNATIVE_METHODS_AVAILABLE:
                             try:
                                 alternative_analysis = alternative_detection_methods.comprehensive_alternative_analysis(channel_id, all_gifs_list, gif_ids)
                             except Exception as e:
-                                print(f"  ⚠️  Alternative methods error: {str(e)}")
+                                _log(f"  ⚠️  Alternative methods error: {str(e)}")
                                 alternative_analysis = None
                         
                         if alternative_analysis and alternative_analysis.get('alternative_status') == 'working' and alternative_analysis.get('composite_score', 0) >= 50:
@@ -4974,7 +5357,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                             analysis['banned'] = False
                             analysis['alternative_methods'] = alternative_analysis
                             analysis['analysis_reasons'].append(f'✅ WORKING: Alternative methods indicate working channel (score: {alternative_analysis.get("composite_score", 0)}/100) despite endpoint 404')
-                            print(f"  ✅ STATUS: WORKING (Alternative methods - score: {alternative_analysis.get('composite_score', 0)}/100)")
+                            _log(f"  ✅ STATUS: WORKING (Alternative methods - score: {alternative_analysis.get('composite_score', 0)}/100)")
                         else:
                             # Few uploads + no accessibility data + scraping failed = shadow banned
                             analysis['shadow_banned'] = True
@@ -4982,17 +5365,17 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                             analysis['banned'] = False
                             analysis['status'] = 'shadow_banned'
                             analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Channel visible with {total_uploads} uploads but user endpoint 404. View scraping failed and no accessibility data - SHADOW BANNED')
-                            print(f"  👻 SHADOW BANNED: Endpoint 404 + no accessibility data + view scraping failed")
+                            _log(f"  👻 SHADOW BANNED: Endpoint 404 + no accessibility data + view scraping failed")
                     else:
                         # No view data yet - try alternative methods
-                        print(f"  ⚠️  No view data - trying alternative detection methods...")
+                        _log(f"  ⚠️  No view data - trying alternative detection methods...")
                         gif_ids = [gif.get('id') for gif in all_gifs_list if gif.get('id')] if all_gifs_list else []
                         alternative_analysis = None
                         if ALTERNATIVE_METHODS_AVAILABLE:
                             try:
                                 alternative_analysis = alternative_detection_methods.comprehensive_alternative_analysis(channel_id, all_gifs_list, gif_ids)
                             except Exception as e:
-                                print(f"  ⚠️  Alternative methods error: {str(e)}")
+                                _log(f"  ⚠️  Alternative methods error: {str(e)}")
                                 alternative_analysis = None
                         
                         if alternative_analysis and alternative_analysis.get('alternative_status') != 'unknown':
@@ -5006,36 +5389,36 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                                 analysis['shadow_banned'] = False
                                 analysis['banned'] = False
                                 analysis['analysis_reasons'].append(f'✅ WORKING: Alternative methods indicate working channel (score: {composite_score}/100)')
-                                print(f"  ✅ STATUS: WORKING (Alternative methods - score: {composite_score}/100)")
+                                _log(f"  ✅ STATUS: WORKING (Alternative methods - score: {composite_score}/100)")
                             elif alt_status == 'shadow_banned':
                                 analysis['shadow_banned'] = True
                                 analysis['working'] = False
                                 analysis['status'] = 'shadow_banned'
                                 analysis['banned'] = False
                                 analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Alternative methods indicate shadow banned (score: {composite_score}/100)')
-                                print(f"  👻 STATUS: SHADOW BANNED (Alternative methods - score: {composite_score}/100)")
+                                _log(f"  👻 STATUS: SHADOW BANNED (Alternative methods - score: {composite_score}/100)")
                             else:
                                 analysis['status'] = 'unknown'
                                 analysis['working'] = False
                                 analysis['shadow_banned'] = False
                                 analysis['analysis_reasons'].append(f'⚠️  UNKNOWN: Alternative methods inconclusive (score: {composite_score}/100)')
-                                print(f"  ⚠️  UNKNOWN: Alternative methods inconclusive (score: {composite_score}/100)")
+                                _log(f"  ⚠️  UNKNOWN: Alternative methods inconclusive (score: {composite_score}/100)")
                         else:
                             analysis['status'] = 'unknown'
                             analysis['working'] = False
                             analysis['shadow_banned'] = False
                             analysis['analysis_reasons'].append(f'⚠️  UNKNOWN: Channel visible but user endpoint 404. Need view data to verify if views are increasing')
-                            print(f"  ⚠️  UNKNOWN: Endpoint 404 + no view data - need view tracking to verify")
+                            _log(f"  ⚠️  UNKNOWN: Endpoint 404 + no view data - need view tracking to verify")
             elif scraping_failed:
                 # Scraping failed - try alternative methods
-                print(f"  ⚠️  View scraping failed - trying alternative detection methods...")
+                _log(f"  ⚠️  View scraping failed - trying alternative detection methods...")
                 gif_ids = [gif.get('id') for gif in all_gifs_list if gif.get('id')] if all_gifs_list else []
                 alternative_analysis = None
                 if ALTERNATIVE_METHODS_AVAILABLE:
                     try:
                         alternative_analysis = alternative_detection_methods.comprehensive_alternative_analysis(channel_id, all_gifs_list, gif_ids)
                     except Exception as e:
-                        print(f"  ⚠️  Alternative methods error: {str(e)}")
+                        _log(f"  ⚠️  Alternative methods error: {str(e)}")
                         alternative_analysis = None
                 
                 if alternative_analysis and alternative_analysis.get('alternative_status') != 'unknown':
@@ -5049,36 +5432,36 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['shadow_banned'] = False
                         analysis['banned'] = False
                         analysis['analysis_reasons'].append(f'✅ WORKING: Alternative methods indicate working channel (score: {composite_score}/100)')
-                        print(f"  ✅ STATUS: WORKING (Alternative methods - score: {composite_score}/100)")
+                        _log(f"  ✅ STATUS: WORKING (Alternative methods - score: {composite_score}/100)")
                     elif alt_status == 'shadow_banned':
                         analysis['shadow_banned'] = True
                         analysis['working'] = False
                         analysis['status'] = 'shadow_banned'
                         analysis['banned'] = False
                         analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Alternative methods indicate shadow banned (score: {composite_score}/100)')
-                        print(f"  👻 STATUS: SHADOW BANNED (Alternative methods - score: {composite_score}/100)")
+                        _log(f"  👻 STATUS: SHADOW BANNED (Alternative methods - score: {composite_score}/100)")
                     else:
                         analysis['status'] = 'unknown'
                         analysis['working'] = False
                         analysis['shadow_banned'] = False
                         analysis['analysis_reasons'].append(f'⚠️  UNKNOWN: Alternative methods inconclusive (score: {composite_score}/100)')
-                        print(f"  ⚠️  UNKNOWN: Alternative methods inconclusive (score: {composite_score}/100)")
+                        _log(f"  ⚠️  UNKNOWN: Alternative methods inconclusive (score: {composite_score}/100)")
                 else:
                     analysis['status'] = 'unknown'
                     analysis['working'] = False
                     analysis['shadow_banned'] = False
                     analysis['analysis_reasons'].append(f'Channel accessible with {total_uploads} uploads, but view scraping failed. Cannot determine status without view data.')
-                    print(f"  ⚠️  UNKNOWN: View scraping failed - cannot determine status")
+                    _log(f"  ⚠️  UNKNOWN: View scraping failed - cannot determine status")
             else:
                 # No view data yet, but haven't tried scraping - try alternative methods
-                print(f"  ⚠️  No view data - trying alternative detection methods...")
+                _log(f"  ⚠️  No view data - trying alternative detection methods...")
                 gif_ids = [gif.get('id') for gif in all_gifs_list if gif.get('id')] if all_gifs_list else []
                 alternative_analysis = None
                 if ALTERNATIVE_METHODS_AVAILABLE:
                     try:
                         alternative_analysis = alternative_detection_methods.comprehensive_alternative_analysis(channel_id, all_gifs_list, gif_ids)
                     except Exception as e:
-                        print(f"  ⚠️  Alternative methods error: {str(e)}")
+                        _log(f"  ⚠️  Alternative methods error: {str(e)}")
                         alternative_analysis = None
                 
                 if alternative_analysis and alternative_analysis.get('alternative_status') != 'unknown':
@@ -5092,31 +5475,31 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                         analysis['shadow_banned'] = False
                         analysis['banned'] = False
                         analysis['analysis_reasons'].append(f'✅ WORKING: Alternative methods indicate working channel (score: {composite_score}/100)')
-                        print(f"  ✅ STATUS: WORKING (Alternative methods - score: {composite_score}/100)")
+                        _log(f"  ✅ STATUS: WORKING (Alternative methods - score: {composite_score}/100)")
                     elif alt_status == 'shadow_banned':
                         analysis['shadow_banned'] = True
                         analysis['working'] = False
                         analysis['status'] = 'shadow_banned'
                         analysis['banned'] = False
                         analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Alternative methods indicate shadow banned (score: {composite_score}/100)')
-                        print(f"  👻 STATUS: SHADOW BANNED (Alternative methods - score: {composite_score}/100)")
+                        _log(f"  👻 STATUS: SHADOW BANNED (Alternative methods - score: {composite_score}/100)")
                     else:
                         analysis['status'] = 'unknown'
                         analysis['working'] = False
                         analysis['shadow_banned'] = False
                         analysis['analysis_reasons'].append(f'⚠️  UNKNOWN: Alternative methods inconclusive (score: {composite_score}/100)')
-                        print(f"  ⚠️  UNKNOWN: Alternative methods inconclusive (score: {composite_score}/100)")
+                        _log(f"  ⚠️  UNKNOWN: Alternative methods inconclusive (score: {composite_score}/100)")
                 else:
                     analysis['status'] = 'unknown'
                     analysis['working'] = False
                     analysis['shadow_banned'] = False
                     analysis['analysis_reasons'].append(f'Channel accessible but no view trend data. Need to collect views over 2 days for accurate analysis.')
-                    print(f"  ⚠️  UNKNOWN: No view data - need 2 days of view tracking")
+                    _log(f"  ⚠️  UNKNOWN: No view data - need 2 days of view tracking")
     
     # Final determination
-    print(f"\nAnalysis Result:")
-    print(f"  Status: {analysis['status']}")
-    print(f"  Shadow Banned: {analysis['shadow_banned']}")
+    _log(f"\nAnalysis Result:")
+    # print(f"  Status: {analysis['status']}")
+    _log(f"  Shadow Banned: {analysis['shadow_banned']}")
     # FINAL COMBINED DECISION: Prioritize Search Visibility
     # WORKING = Visible in search results (regardless of view trends) OR (5+ tags found in search)
     # SHADOW BANNED = Not visible in search AND (views stagnant OR tags not found)
@@ -5168,10 +5551,10 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
             # Note: views_difference < 0 (decreasing) is treated as WORKING (normal fluctuation)
         
         # Final decision based on BOTH factors
-        print(f"\n{'='*50}")
-        print(f"FINAL COMBINED DECISION (Search Visibility + View Trends)")
-        print(f"{'='*50}")
-        print(f"  Search Visibility: {'✅ Visible' if visible_in_search else '❌ Not Visible'}")
+        _log(f"\n{'='*50}")
+        _log(f"FINAL COMBINED DECISION (Search Visibility + View Trends)")
+        _log(f"{'='*50}")
+        _log(f"  Search Visibility: {'✅ Visible' if visible_in_search else '❌ Not Visible'}")
         if yesterday_data_available:
             if views_stagnant:
                 trend_text = f'❌ Stagnant ({views_difference:+,} views)'
@@ -5181,9 +5564,9 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                 trend_text = f'✅ Increasing ({views_difference:+,} views)'
             else:
                 trend_text = f'⚠️  Small increase ({views_difference:+,} views)'
-            print(f"  View Trend: {trend_text}")
+            _log(f"  View Trend: {trend_text}")
         else:
-            print(f"  View Trend: ⚠️  No previous data available")
+            _log(f"  View Trend: ⚠️  No previous data available")
         
         # Check tags visibility if available (from new GIF-by-GIF check)
         if search_visibility:
@@ -5191,9 +5574,9 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
             total_tags_found = search_visibility.get('total_tags_found', 0)
             total_tags_tested = search_visibility.get('total_tags_tested', 0)
             if gifs_with_5_plus > 0:
-                print(f"  GIFs with 5+ tags: ✅ {gifs_with_5_plus} GIF(s)")
+                _log(f"  GIFs with 5+ tags: ✅ {gifs_with_5_plus} GIF(s)")
             if total_tags_found > 0:
-                print(f"  Tags Visibility: ✅ {total_tags_found}/{total_tags_tested} tags found channel GIFs in search")
+                _log(f"  Tags Visibility: ✅ {total_tags_found}/{total_tags_tested} tags found channel GIFs in search")
         
         # WORKING if: Visible in search (at least one GIF has 5+ tags that return it)
         if visible_in_search:
@@ -5214,7 +5597,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
             reason_str = ' AND '.join(reason_parts)
             analysis['analysis_reasons'].append(f'✅ WORKING: Channel {reason_str}')
             gifs_with_5_plus = search_visibility.get('gifs_with_5_plus_tags', 0) if search_visibility else 0
-            print(f"  ✅ FINAL STATUS: WORKING ({gifs_with_5_plus} GIF(s) have 5+ tags that return them in search)")
+            # print(f"  ✅ FINAL STATUS: WORKING ({gifs_with_5_plus} GIF(s) have 5+ tags that return them in search)")
         elif not visible_in_search or (yesterday_data_available and views_stagnant):
             # SHADOW BANNED: Views stagnant (but visible in search - this shouldn't happen due to earlier check, but keep as fallback)
             analysis['shadow_banned'] = True
@@ -5228,7 +5611,7 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                     reasons.append('no GIFs have 5+ tags that return them in search')
             reason_str = ' and '.join(reasons)
             analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Channel {reason_str}')
-            print(f"  👻 FINAL STATUS: SHADOW BANNED ({reason_str})")
+            # print(f"  👻 FINAL STATUS: SHADOW BANNED ({reason_str})")
         else:
             # No previous view data - use search visibility only
             if visible_in_search:
@@ -5236,18 +5619,18 @@ def analyze_channel_status(user_data, all_gifs_list, user_id, gifs_endpoint_404=
                 analysis['status'] = 'working'
                 analysis['shadow_banned'] = False
                 analysis['analysis_reasons'].append(f'✅ WORKING: Channel visible in search results (view trend data not yet available)')
-                print(f"  ✅ FINAL STATUS: WORKING (Visible in search, view trend pending)")
+                # print(f"  ✅ FINAL STATUS: WORKING (Visible in search, view trend pending)")
             else:
                 analysis['shadow_banned'] = True
                 analysis['working'] = False
                 analysis['status'] = 'shadow_banned'
                 analysis['analysis_reasons'].append(f'👻 SHADOW BANNED: Channel not visible in search results')
-                print(f"  👻 FINAL STATUS: SHADOW BANNED (Not visible in search)")
+                # print(f"  👻 FINAL STATUS: SHADOW BANNED (Not visible in search)")
     
-    print(f"  Banned: {analysis['banned']}")
-    print(f"  Working: {analysis['working']}")
-    print(f"  Reasons: {', '.join(analysis['analysis_reasons'])}")
-    print(f"{'='*50}\n")
+    _log(f"  Banned: {analysis['banned']}")
+    _log(f"  Working: {analysis['working']}")
+    _log(f"  Reasons: {', '.join(analysis['analysis_reasons'])}")
+    _log(f"{'='*50}\n")
     
     return analysis
 
@@ -5278,10 +5661,10 @@ def check_channel_status(channel_identifier, original_url=None):
         results['status'] = 'error'
         return results
     
-    print(f"\n{'='*50}")
-    print(f"Searching for channel: {channel_identifier}")
-    print(f"Using API Key: {GIPHY_API_KEY[:10]}...")
-    print(f"{'='*50}\n")
+    _log(f"\n{'='*50}")
+    _log(f"Searching for channel: {channel_identifier}")
+    _log(f"Using API Key: {GIPHY_API_KEY[:10]}...")
+    _log(f"{'='*50}\n")
     
     try:
         # Step 1: Search for the user/channel using multiple methods
@@ -5296,24 +5679,24 @@ def check_channel_status(channel_identifier, original_url=None):
         # Method 1: Search GIFs by username parameter (PRIMARY METHOD)
         # NOTE: /users/search endpoint doesn't exist (returns 404), so we skip it
         # and use GIF search by username which is the reliable method
-        print("Using GIF search by username (primary method)")
-        print(f"Searching for: {channel_identifier}\n")
+        _log("Using GIF search by username (primary method)")
+        _log(f"Searching for: {channel_identifier}\n")
         
         # Method 1: Search GIFs by username parameter (PRIMARY METHOD)
         method1_gifs = []  # Initialize variable to store GIFs found
         if not user_data:
             try:
-                print(f"Method 1: Search GIFs AND Stickers by username (fetching ALL uploads)")
+                _log(f"Method 1: Search GIFs AND Stickers by username (fetching ALL uploads)")
                 
                 # Fetch ALL GIFs and Stickers with pagination
                 all_search_gifs = []
                 limit = 50  # Maximum per request
                 max_pages = 10  # Fetch up to 500 items
                 
-                print(f"  Username: {channel_identifier}")
+                _log(f"  Username: {channel_identifier}")
                 
                 # First, fetch GIFs
-                print(f"  Fetching GIFs...")
+                _log(f"  Fetching GIFs...")
                 gifs_search_url = f"{GIPHY_API_BASE}/gifs/search"
                 offset = 0
                 
@@ -5338,7 +5721,7 @@ def check_channel_status(channel_identifier, original_url=None):
                             total_count = pagination.get('total_count', 0)
                             current_total = len(all_search_gifs)
                             
-                            print(f"    GIFs Page {page + 1}: {len(gifs_list)} found (Total: {current_total}, API total: {total_count})")
+                            _log(f"    GIFs Page {page + 1}: {len(gifs_list)} found (Total: {current_total}, API total: {total_count})")
                             
                             if total_count > 0 and current_total >= total_count:
                                 break
@@ -5352,7 +5735,7 @@ def check_channel_status(channel_identifier, original_url=None):
                         break
                 
                 # Now fetch Stickers separately
-                print(f"  Fetching Stickers...")
+                _log(f"  Fetching Stickers...")
                 stickers_search_url = f"{GIPHY_API_BASE}/stickers/search"
                 stickers_offset = 0
                 
@@ -5380,7 +5763,7 @@ def check_channel_status(channel_identifier, original_url=None):
                             stickers_total_count = stickers_pagination.get('total_count', 0)
                             current_stickers_total = len([g for g in all_search_gifs if g.get('is_sticker')])
                             
-                            print(f"    Stickers Page {page + 1}: {len(stickers_list)} found (Total stickers: {current_stickers_total}, API total: {stickers_total_count})")
+                            _log(f"    Stickers Page {page + 1}: {len(stickers_list)} found (Total stickers: {current_stickers_total}, API total: {stickers_total_count})")
                             
                             if stickers_total_count > 0 and current_stickers_total >= stickers_total_count:
                                 break
@@ -5395,11 +5778,11 @@ def check_channel_status(channel_identifier, original_url=None):
                 
                 gifs_count = len([g for g in all_search_gifs if not g.get('is_sticker')])
                 stickers_count = len([g for g in all_search_gifs if g.get('is_sticker')])
-                print(f"  Total uploads found: {len(all_search_gifs)} ({gifs_count} GIFs + {stickers_count} stickers)")
+                _log(f"  Total uploads found: {len(all_search_gifs)} ({gifs_count} GIFs + {stickers_count} stickers)")
                 
                 if len(all_search_gifs) > 0:
                     # Extract user info from first GIF (don't break early - we need all GIFs)
-                    print(f"  Extracting user info from GIFs...")
+                    _log(f"  Extracting user info from GIFs...")
                     user_found = False
                     for gif in all_search_gifs:
                         if gif.get('user'):
@@ -5408,7 +5791,7 @@ def check_channel_status(channel_identifier, original_url=None):
                             if gif_username == search_lower:
                                 if not user_found:
                                     user_data = user_from_gif
-                                    print(f"    ✓ FOUND MATCHING USER: {gif_username}")
+                                    _log(f"    ✓ FOUND MATCHING USER: {gif_username}")
                                     user_found = True
                                     # Don't break - continue to collect all GIFs
                     
@@ -5420,11 +5803,11 @@ def check_channel_status(channel_identifier, original_url=None):
                             first_username = first_user.get('username', '').lower()
                             if search_lower in first_username or first_username in search_lower:
                                 user_data = first_user
-                                print(f"    ~ Using similar user: {first_username}")
+                                _log(f"    ~ Using similar user: {first_username}")
                     
                     # Always store all GIFs found
                     method1_gifs = all_search_gifs.copy()
-                    print(f"  Stored {len(method1_gifs)} total uploads for processing")
+                    _log(f"  Stored {len(method1_gifs)} total uploads for processing")
                 
                 if not user_data and len(all_search_gifs) > 0:
                     # If still no user_data, use the first GIF's user
@@ -5432,11 +5815,11 @@ def check_channel_status(channel_identifier, original_url=None):
                     if first_gif.get('user'):
                         user_data = first_gif['user']
                         method1_gifs = all_search_gifs.copy()
-                        print(f"    Using user from first GIF: {user_data.get('username')}")
+                        _log(f"    Using user from first GIF: {user_data.get('username')}")
                 else:
-                    print(f"  Error response: {gifs_search_response.text[:200]}")
+                    _log(f"  Error response: {gifs_search_response.text[:200]}")
             except Exception as e:
-                print(f"Method 1 error: {str(e)}")
+                _log(f"Method 1 error: {str(e)}")
                 import traceback
                 traceback.print_exc()
                 pass  # Continue to next method
@@ -5444,7 +5827,7 @@ def check_channel_status(channel_identifier, original_url=None):
         # Method 2: Try general GIF search with channel name (search GIFs by this username in title/description)
         if not user_data:
             try:
-                print(f"\nMethod 2: General GIF search with channel name as query")
+                _log(f"\nMethod 2: General GIF search with channel name as query")
                 gifs_search_url = f"{GIPHY_API_BASE}/gifs/search"
                 gifs_search_params = {
                     'api_key': GIPHY_API_KEY,
@@ -5452,61 +5835,61 @@ def check_channel_status(channel_identifier, original_url=None):
                     'limit': 50
                 }
                 
-                print(f"  Query: {channel_identifier}")
+                _log(f"  Query: {channel_identifier}")
                 gifs_search_response = _requests_session.get(gifs_search_url, params=gifs_search_params, timeout=10)
-                print(f"  Response Status: {gifs_search_response.status_code}")
+                # print(f"  Response Status: {gifs_search_response.status_code}")
                 
                 if gifs_search_response.status_code == 200:
                     gifs_data = gifs_search_response.json()
                     gifs_list = gifs_data.get('data', [])
-                    print(f"  Found {len(gifs_list)} GIFs")
+                    _log(f"  Found {len(gifs_list)} GIFs")
                     
                     if len(gifs_list) > 0:
                         # Check if any of these GIFs belong to the user we're looking for
-                        print(f"  Checking GIFs for matching user...")
+                        _log(f"  Checking GIFs for matching user...")
                         for gif in gifs_list:
                             if gif.get('user'):
                                 gif_user = gif['user']
                                 gif_username = gif_user.get('username', '').lower()
-                                print(f"    - GIF from user: {gif_username}")
+                                _log(f"    - GIF from user: {gif_username}")
                                 if gif_username == search_lower:
                                     user_data = gif_user
-                                    print(f"    ✓ FOUND MATCHING USER: {gif_username}")
+                                    _log(f"    ✓ FOUND MATCHING USER: {gif_username}")
                                     break
             except Exception as e:
-                print(f"Method 2 error: {str(e)}")
+                _log(f"Method 2 error: {str(e)}")
                 pass  # Continue to next method
         
         # Method 3: Try direct user lookup by username if available
         # Some channels might be accessible via direct user endpoint
         if not user_data:
             try:
-                print(f"\nMethod 3: Direct user lookup by username")
+                _log(f"\nMethod 3: Direct user lookup by username")
                 direct_user_url = f"{GIPHY_API_BASE}/users/{channel_identifier}"
                 direct_user_params = {
                     'api_key': GIPHY_API_KEY
                 }
                 
                 direct_user_response = _requests_session.get(direct_user_url, params=direct_user_params, timeout=10)
-                print(f"  Response Status: {direct_user_response.status_code}")
+                # print(f"  Response Status: {direct_user_response.status_code}")
                 
                 if direct_user_response.status_code == 200:
                     direct_user_data = direct_user_response.json()
                     if direct_user_data.get('data'):
                         user_data = direct_user_data['data']
-                        print(f"  ✓ Found user via direct lookup: {user_data.get('username')}")
+                        _log(f"  ✓ Found user via direct lookup: {user_data.get('username')}")
                 else:
-                    print(f"  Direct lookup failed - endpoint may not exist")
+                    _log(f"  Direct lookup failed - endpoint may not exist")
             except Exception as e:
-                print(f"Method 3 error: {str(e)}")
+                _log(f"Method 3 error: {str(e)}")
                 pass  # Continue to next method
         
-        print(f"\n{'='*50}")
+        _log(f"\n{'='*50}")
         if user_data:
-            print(f"✓ USER FOUND: {user_data.get('username')}")
+            _log(f"✓ USER FOUND: {user_data.get('username')}")
         else:
-            print(f"✗ User not found via API methods")
-        print(f"{'='*50}\n")
+            _log(f"✗ User not found via API methods")
+        _log(f"{'='*50}\n")
         
         # Step 2: If user found via API, fetch all channel data using API
         if user_data:
@@ -5539,7 +5922,7 @@ def check_channel_status(channel_identifier, original_url=None):
             
             # Step 3: Fetch ALL channel's GIFs using API to get complete analytics
             user_id = user_data.get('id')
-            print(f"User ID found: {user_id}")
+            _log(f"User ID found: {user_id}")
             
             if user_id:
                 # Get user's GIFs using API - fetch with pagination to get ALL data
@@ -5550,10 +5933,10 @@ def check_channel_status(channel_identifier, original_url=None):
                     'offset': 0
                 }
                 
-                print(f"\nFetching GIFs for user_id: {user_id}")
-                print(f"GIFs URL: {gifs_url}")
+                _log(f"\nFetching GIFs for user_id: {user_id}")
+                _log(f"GIFs URL: {gifs_url}")
                 gifs_response = _requests_session.get(gifs_url, params=gifs_params, timeout=15)
-                print(f"GIFs Response Status: {gifs_response.status_code}")
+                # print(f"GIFs Response Status: {gifs_response.status_code}")
                 
                 if gifs_response.status_code == 200:
                     gifs_data = gifs_response.json()
@@ -5827,9 +6210,9 @@ def check_channel_status(channel_identifier, original_url=None):
                     results['working'] = False
                 elif gifs_response.status_code == 404:
                     # User exists but GIFs endpoint returns 404 - use GIFs from Method 1 search instead
-                    print(f"GIFs endpoint returned 404. Using GIFs found in Method 1 search...")
+                    _log(f"GIFs endpoint returned 404. Using GIFs found in Method 1 search...")
                     if 'method1_gifs' in locals() and len(method1_gifs) > 0:
-                        print(f"Processing {len(method1_gifs)} GIFs from Method 1...")
+                        _log(f"Processing {len(method1_gifs)} GIFs from Method 1...")
                         
                         # Process GIFs and check accessibility via detail endpoint
                         all_gifs_with_details = []
@@ -5837,7 +6220,7 @@ def check_channel_status(channel_identifier, original_url=None):
                         
                         # Check first 10 GIFs for accessibility (sample)
                         sample_size = min(10, len(method1_gifs))
-                        print(f"  Checking accessibility of {sample_size} GIFs via detail endpoint...")
+                        _log(f"  Checking accessibility of {sample_size} GIFs via detail endpoint...")
                         time.sleep(0.2)  # Small delay before starting checks
                         
                         total_views_all = 0
@@ -5854,7 +6237,7 @@ def check_channel_status(channel_identifier, original_url=None):
                                         is_accessible = True
                                         if idx < sample_size:
                                             accessible_gifs_via_detail += 1
-                                            print(f"    ✓ GIF {gif_id[:12]}... is accessible via detail endpoint")
+                                            _log(f"    ✓ GIF {gif_id[:12]}... is accessible via detail endpoint")
                                         
                                         # Get views from detail endpoint
                                         gif_detail = gif_detail_response.json().get('data', {})
@@ -5883,7 +6266,7 @@ def check_channel_status(channel_identifier, original_url=None):
                                         })
                                     else:
                                         if idx < sample_size:
-                                            print(f"    ✗ GIF {gif_id[:12]}... returned {gif_detail_response.status_code}")
+                                            _log(f"    ✗ GIF {gif_id[:12]}... returned {gif_detail_response.status_code}")
                                         # Use basic info if detail fetch fails
                                         gif_views = int(gif.get('views', 0) or 0)
                                         total_views_all += gif_views
@@ -5908,7 +6291,7 @@ def check_channel_status(channel_identifier, original_url=None):
                                         })
                                 except Exception as e:
                                     if idx < sample_size:
-                                        print(f"    ✗ GIF {gif_id[:12]}... error: {str(e)[:30]}")
+                                        _log(f"    ✗ GIF {gif_id[:12]}... error: {str(e)[:30]}")
                                     # Use basic info if detail fetch fails
                                     gif_views = int(gif.get('views', 0) or 0)
                                     total_views_all += gif_views
@@ -5937,10 +6320,10 @@ def check_channel_status(channel_identifier, original_url=None):
                                     time.sleep(0.1)
                             
                             if (idx + 1) % 20 == 0:
-                                print(f"  Processed {idx + 1}/{len(method1_gifs)} uploads... (Total views so far: {total_views_all:,})")
+                                _log(f"  Processed {idx + 1}/{len(method1_gifs)} uploads... (Total views so far: {total_views_all:,})")
                         
-                        print(f"  ✓ Processed all GIFs")
-                        print(f"  Accessibility check completed: {accessible_gifs_via_detail}/{sample_size} GIFs accessible in checked sample")
+                        _log(f"  ✓ Processed all GIFs")
+                        _log(f"  Accessibility check completed: {accessible_gifs_via_detail}/{sample_size} GIFs accessible in checked sample")
                             
                         # Store the processed GIFs
                         results['details']['total_uploads'] = len(all_gifs_with_details)
@@ -5968,15 +6351,15 @@ def check_channel_status(channel_identifier, original_url=None):
                             # Extrapolate: if X out of sample_size are accessible, estimate for all
                             accessible_ratio = accessible_gifs_via_detail / sample_size
                             accessible_count = int(accessible_ratio * len(method1_gifs))
-                            print(f"  Accessibility summary: {accessible_gifs_via_detail}/{sample_size} checked accessible, estimated {accessible_count}/{len(method1_gifs)} total ({accessible_ratio*100:.1f}%)")
+                            _log(f"  Accessibility summary: {accessible_gifs_via_detail}/{sample_size} checked accessible, estimated {accessible_count}/{len(method1_gifs)} total ({accessible_ratio*100:.1f}%)")
                         elif sample_size == len(method1_gifs):
                             # Checked all GIFs
                             accessible_count = accessible_gifs_via_detail
-                            print(f"  Accessibility summary: {accessible_gifs_via_detail}/{len(method1_gifs)} GIFs accessible ({accessible_count/len(method1_gifs)*100:.1f}%)")
+                            _log(f"  Accessibility summary: {accessible_gifs_via_detail}/{len(method1_gifs)} GIFs accessible ({accessible_count/len(method1_gifs)*100:.1f}%)")
                         else:
                             # No accessibility data - use sample size as estimate
                             accessible_count = 0
-                            print(f"  Accessibility summary: No GIFs accessible in checked sample")
+                            _log(f"  Accessibility summary: No GIFs accessible in checked sample")
                         
                         analysis_result = analyze_channel_status(user_data, all_gifs_with_details, user_id, True, channel_identifier, auto_check_views=True, gifs_accessible_via_detail=accessible_count)
                         results.update(analysis_result)
@@ -5985,8 +6368,8 @@ def check_channel_status(channel_identifier, original_url=None):
                         if analysis_result.get('analysis_reasons'):
                             results['details']['analysis_reasons'] = analysis_result['analysis_reasons']
                         
-                        print(f"✓ Processed {len(all_gifs_with_details)} uploads")
-                        print(f"✓ Analysis: Status={results.get('status')}, Shadow Banned={results.get('shadow_banned')}, Working={results.get('working')}")
+                        _log(f"✓ Processed {len(all_gifs_with_details)} uploads")
+                        _log(f"✓ Analysis: Status={results.get('status')}, Shadow Banned={results.get('shadow_banned')}, Working={results.get('working')}")
                     else:
                         # No GIFs from Method 1 - analyze status
                         if user_data:
@@ -6015,7 +6398,7 @@ def check_channel_status(channel_identifier, original_url=None):
             else:
                 # User found but no user_id - use the GIFs we found in Method 1
                 if 'method1_gifs' in locals() and len(method1_gifs) > 0:
-                    print(f"User found but no user_id. Processing {len(method1_gifs)} GIFs from Method 1 search with detailed views...")
+                    _log(f"User found but no user_id. Processing {len(method1_gifs)} GIFs from Method 1 search with detailed views...")
                     
                     # Process each GIF individually to get accurate view counts
                     all_gifs_with_details = []
@@ -6112,19 +6495,19 @@ def check_channel_status(channel_identifier, original_url=None):
                     if analysis_result.get('analysis_reasons'):
                         results['details']['analysis_reasons'] = analysis_result['analysis_reasons']
                     
-                    print(f"✓ Processed {len(all_gifs_with_details)} GIFs with {total_views_all:,} total views")
-                    print(f"✓ Analysis: Status={results.get('status')}, Shadow Banned={results.get('shadow_banned')}, Working={results.get('working')}")
+                    _log(f"✓ Processed {len(all_gifs_with_details)} GIFs with {total_views_all:,} total views")
+                    _log(f"✓ Analysis: Status={results.get('status')}, Shadow Banned={results.get('shadow_banned')}, Working={results.get('working')}")
                 else:
                     results['status'] = 'unknown'
                     results['error'] = 'User found but no user_id and no GIFs available'
         
         # Check if we successfully found user and processed their data
         if user_data and results.get('exists'):
-            print(f"\n✓ Final Results:")
-            print(f"  Exists: {results.get('exists')}")
-            print(f"  Status: {results.get('status')}")
-            print(f"  GIFs: {len(results.get('details', {}).get('all_gifs', []))}")
-            print(f"  Total Views: {results.get('details', {}).get('total_views', 0)}")
+            _log(f"\n✓ Final Results:")
+            _log(f"  Exists: {results.get('exists')}")
+            # print(f"  Status: {results.get('status')}")
+            _log(f"  GIFs: {len(results.get('details', {}).get('all_gifs', []))}")
+            # print(f"  Total Views: {results.get('details', {}).get('total_views', 0)}")
         
         if not user_data:
             # User not found in API search - try alternative methods to get channel info
@@ -6149,7 +6532,7 @@ def check_channel_status(channel_identifier, original_url=None):
                 if gifs_by_user_response.status_code == 200:
                     gifs_data = gifs_by_user_response.json()
                     gifs_list = gifs_data.get('data', [])
-                    print(f"Found {len(gifs_list)} GIFs in fallback search")
+                    _log(f"Found {len(gifs_list)} GIFs in fallback search")
                     
                     if len(gifs_list) > 0:
                         # Extract user info from GIFs
@@ -6157,11 +6540,11 @@ def check_channel_status(channel_identifier, original_url=None):
                             if gif.get('user'):
                                 gif_user = gif['user']
                                 gif_username = gif_user.get('username', '').lower()
-                                print(f"  Checking GIF from user: {gif_username}")
+                                _log(f"  Checking GIF from user: {gif_username}")
                                 if gif_username == search_lower:
                                     user_data = gif_user
                                     found_via_gifs = True
-                                    print(f"  ✓ Found matching user: {gif_username}")
+                                    _log(f"  ✓ Found matching user: {gif_username}")
                                     break
                         
                         if found_via_gifs and user_data:
@@ -6472,9 +6855,9 @@ def check_channel_status(channel_identifier, original_url=None):
             
             # Final fallback - check search visibility before marking as banned/not_found
             # Search for channel name in Giphy - if no GIFs found, it's BANNED
-            print(f"\n{'='*50}")
-            print(f"Final check: Searching for channel '{channel_identifier}' in Giphy search results")
-            print(f"{'='*50}")
+            _log(f"\n{'='*50}")
+            _log(f"Final check: Searching for channel '{channel_identifier}' in Giphy search results")
+            _log(f"{'='*50}")
             try:
                 search_visibility = check_channel_in_search_results(
                     channel_identifier,
@@ -6488,8 +6871,8 @@ def check_channel_status(channel_identifier, original_url=None):
                     
                     if not visible_in_search:
                         # Channel name not found in search results = BANNED
-                        print(f"  🚫 Channel '{channel_identifier}' not found in search results (no GIFs/views)")
-                        print(f"     Tested queries: {', '.join(queries_tested[:5])}")
+                        _log(f"  🚫 Channel '{channel_identifier}' not found in search results (no GIFs/views)")
+                        _log(f"     Tested queries: {', '.join(queries_tested[:5])}")
                         results['exists'] = True  # Channel exists (we searched for it), just banned
                         results['status'] = 'banned'
                         results['banned'] = True
@@ -6503,17 +6886,17 @@ def check_channel_status(channel_identifier, original_url=None):
                         results['error'] = f'Channel "{channel_identifier}" not found in Giphy search results. Channel is banned.'
                     else:
                         # Channel found in search but API failed - unusual case
-                        print(f"  ⚠️  Channel '{channel_identifier}' found in search ({matching_count} GIFs) but API failed")
+                        _log(f"  ⚠️  Channel '{channel_identifier}' found in search ({matching_count} GIFs) but API failed")
                         results['exists'] = True
                         results['status'] = 'unknown'
                         results['error'] = f'Channel found in search but API lookup failed'
                 else:
                     # Search check failed - mark as not_found
-                    print(f"  ⚠️  Search check failed - marking as not_found")
+                    _log(f"  ⚠️  Search check failed - marking as not_found")
                     results['exists'] = False
                     results['status'] = 'not_found'
             except Exception as e:
-                print(f"  ⚠️  Search check error: {str(e)} - marking as not_found")
+                _log(f"  ⚠️  Search check error: {str(e)} - marking as not_found")
                 results['exists'] = False
                 results['status'] = 'not_found'
         
@@ -6551,7 +6934,7 @@ def check_channel_status(channel_identifier, original_url=None):
     
     # Don't overwrite results if we successfully found the user
     if results.get('exists') and results.get('details', {}).get('all_gifs'):
-        print(f"\n✓ Final check: Successfully returning results with {len(results['details']['all_gifs'])} GIFs")
+        _log(f"\n✓ Final check: Successfully returning results with {len(results['details']['all_gifs'])} GIFs")
     
     return results
 
@@ -6814,15 +7197,15 @@ def check_channel():
             ]
         
         # Debug: Print results to console
-        print(f"\n=== Channel Check Results ===")
-        print(f"Channel ID: {channel_username}")
-        print(f"Exists: {results.get('exists')}")
-        print(f"Status: {results.get('status')}")
-        print(f"GIFs found: {len(results.get('details', {}).get('all_gifs', []))}")
-        print(f"Method: {results.get('method')}")
+        _log(f"\n=== Channel Check Results ===")
+        _log(f"Channel ID: {channel_username}")
+        _log(f"Exists: {results.get('exists')}")
+        # print(f"Status: {results.get('status')}")
+        _log(f"GIFs found: {len(results.get('details', {}).get('all_gifs', []))}")
+        _log(f"Method: {results.get('method')}")
         if results.get('error'):
-            print(f"Error: {results.get('error')}")
-        print("=" * 30 + "\n")
+            _log(f"Error: {results.get('error')}")
+        _log("=" * 30 + "\n")
         
         return jsonify(results)
         
@@ -6832,6 +7215,121 @@ def check_channel():
         traceback.print_exc()
         return jsonify({'error': f'Error checking channel: {str(e)}'}), 500
 
+@app.route('/api/check-channels-from-notion', methods=['POST'])
+def check_channels_from_notion():
+    """API endpoint to check channel status for each URL stored in a Notion database."""
+    data = request.json or {}
+    property_name = (data.get('property_name') or NOTION_URL_PROPERTY_NAME or 'Giphy URL').strip()
+
+    if not NOTION_API_KEY:
+        return jsonify({'error': 'Notion API key is required in server environment. Set NOTION_API_KEY in .env or environment.'}), 400
+    if not NOTION_DATABASE_ID:
+        return jsonify({'error': 'Notion database_id is required in server environment. Set NOTION_DATABASE_ID in .env or environment.'}), 400
+
+    try:
+        channels = get_notion_channels_with_metadata()
+        channel_results = []
+
+        for channel in channels:
+            url = channel['giphy_url']
+            detector_result = detect_channel_status(url)
+            status = detector_result.get('status', 'unknown')
+            channel_username = detector_result.get('channel_username')
+
+            channel_results.append({
+                'source_url': url,
+                'channel_username': channel_username,
+                'notion_name': channel.get('name'),
+                'notion_status': channel.get('notion_status'),
+                'status': status,
+                'shadow_banned': status == 'shadow_banned',
+                'banned': status == 'banned',
+                'working': status == 'working',
+                'summary': detector_result.get('summary', {}),
+                'error': detector_result.get('error')
+            })
+            time.sleep(REQUEST_DELAY)
+
+        return jsonify({
+            'success': True,
+            'database_id': database_id,
+            'property_name': property_name,
+            'channels': channel_results,
+            'count': len(channel_results)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/scheduled-channel-status', methods=['GET'])
+def get_scheduled_channel_status():
+    """Return the latest scheduled channel status results."""
+    with scheduled_results_lock:
+        return jsonify(scheduled_results)
+
+
+@app.route('/api/trigger-scheduled-channel-check', methods=['POST'])
+def trigger_scheduled_channel_check():
+    """Trigger a manual scheduled channel status check now."""
+    try:
+        run_scheduled_channel_check()
+        with scheduled_results_lock:
+            return jsonify({
+                'success': True,
+                'last_run': scheduled_results['last_run'],
+                'channel_count': len(scheduled_results['channels'])
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/notion-channels', methods=['GET'])
+def get_notion_channels():
+    """Return list of Verified+Declined channels from Notion (no Giphy status check)."""
+    try:
+        channels = get_notion_channels_with_metadata()
+        return jsonify({'success': True, 'channels': channels, 'count': len(channels)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/check-notion-channel', methods=['POST'])
+def check_single_notion_channel():
+    """Check Giphy status for a single channel URL (called per-row in dashboard)."""
+    data = request.json or {}
+    url = (data.get('url') or '').strip()
+    if not url:
+        return jsonify({'error': 'url is required'}), 400
+    try:
+        result = detect_channel_status(url)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # Only start scheduler in the main Flask process (not in reloader process)
+    if not scheduler_thread_started and os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        scheduler_thread_started = True
+        scheduler_thread = threading.Thread(target=scheduled_channel_checker, daemon=False)
+        scheduler_thread.start()
+        print(f"Started scheduled channel checker thread (interval={SCHEDULED_CHECK_INTERVAL_SECONDS}s)")
+
+        # Setup signal handlers for graceful shutdown
+        def _handle_signal(sig, frame):
+            _log(f"Received signal {sig}, stopping scheduler...")
+            stop_event.set()
+            try:
+                scheduler_thread.join(timeout=10)
+            except Exception:
+                pass
+
+        try:
+            signal.signal(signal.SIGINT, _handle_signal)
+            signal.signal(signal.SIGTERM, _handle_signal)
+        except Exception:
+            # Not all platforms support SIGTERM
+            pass
+
+    app.run(debug=True, port=5000, threaded=True, use_reloader=False)
 

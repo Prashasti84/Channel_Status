@@ -1,314 +1,327 @@
+// ── state ────────────────────────────────────────────────────────────────────
+let allChannels = [];      // raw data from /api/notion-channels
+let checkQueue = [];       // queue for "Check All" operation
+let checkingAll = false;
+let stopRequested = false;
+
+// ── single channel check ─────────────────────────────────────────────────────
 async function checkChannel() {
-    const urlInput = document.getElementById('giphy-url');
-    const checkBtn = document.getElementById('check-btn');
+    const input = document.getElementById('giphy-url');
+    const btn = document.getElementById('check-btn');
     const btnText = document.getElementById('btn-text');
     const btnLoader = document.getElementById('btn-loader');
-    const resultsSection = document.getElementById('results-section');
-    const errorSection = document.getElementById('error-section');
-    
-    const url = urlInput.value.trim();
-    
-    if (!url) {
-        showError('Please enter a Giphy URL');
-        return;
-    }
-    
-    // Show loading state
-    checkBtn.disabled = true;
+    const resultDiv = document.getElementById('single-result');
+
+    const url = input.value.trim();
+    if (!url) { showSingleError('Please enter a Giphy URL'); return; }
+
+    btn.disabled = true;
     btnText.style.display = 'none';
     btnLoader.style.display = 'inline-block';
-    resultsSection.style.display = 'none';
-    errorSection.style.display = 'none';
-    
+    resultDiv.style.display = 'none';
+
     try {
-        const response = await fetch('/api/check-channel', {
+        const res = await fetch('/api/check-channel', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ url: url })
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url })
         });
-        
-        const data = await response.json();
-        
-        if (!response.ok) {
-            throw new Error(data.error || 'An error occurred');
-        }
-        
-        // Debug: Log response data
-        console.log('API Response:', data);
-        
-        displayResults(data);
-        
-    } catch (error) {
-        showError(error.message || 'Failed to check channel status. Please try again.');
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Error checking channel');
+        renderSingleResult(data, resultDiv);
+    } catch (e) {
+        showSingleError(e.message);
     } finally {
-        // Reset button state
-        checkBtn.disabled = false;
+        btn.disabled = false;
         btnText.style.display = 'inline';
         btnLoader.style.display = 'none';
     }
 }
 
-function displayResults(data) {
-    const resultsSection = document.getElementById('results-section');
-    const errorSection = document.getElementById('error-section');
-    
-    errorSection.style.display = 'none';
-    resultsSection.style.display = 'block';
-    
-    // Update status badge
-    updateStatusBadge(data);
-    
-    // Update channel information
-    updateChannelInfo(data);
-    
-    // Update detection results
-    updateDetectionResults(data);
-    
-    // Update status details (hidden but function called for compatibility)
-    updateStatusDetails(data);
-}
-
-function updateStatusBadge(data) {
-    const statusBadge = document.getElementById('status-badge');
-    const statusIcon = document.getElementById('status-icon');
-    const statusText = document.getElementById('status-text');
-    
-    // Remove all status classes
-    statusBadge.className = 'status-badge';
-    
-    let icon = '❓';
-    let text = 'Unknown Status';
-    let statusClass = 'unknown';
-    
-    if (data.banned) {
-        icon = '🚫';
-        text = 'BANNED';
-        statusClass = 'banned';
-    } else if (data.shadow_banned) {
-        icon = '👻';
-        text = 'SHADOW BANNED';
-        statusClass = 'shadow-banned';
-    } else if (data.working) {
-        icon = '✅';
-        text = 'WORKING';
-        statusClass = 'working';
-    } else if (data.status === 'not_found') {
-        icon = '🔍';
-        text = 'NOT FOUND';
-        statusClass = 'not-found';
-    } else if (data.status === 'error') {
-        icon = '⚠️';
-        text = 'ERROR';
-        statusClass = 'unknown';
-    }
-    
-    statusIcon.textContent = icon;
-    statusText.textContent = text;
-    statusBadge.classList.add(statusClass);
-}
-
-function updateChannelInfo(data) {
-    const channelInfo = document.getElementById('channel-info');
+function renderSingleResult(data, container) {
     const details = data.details || {};
-    
-    let html = '';
-    let hasAnyData = false;
-    
-    // Show username (essential)
-    if (details.username) {
-        html += `<div class="info-item"><strong>Username:</strong><span>${escapeHtml(details.username)}</span></div>`;
-        hasAnyData = true;
-    } else if (data.channel_id || data.channel_identifier_from_url) {
-        const channelId = data.channel_id || data.channel_identifier_from_url;
-        html += `<div class="info-item"><strong>Username:</strong><span>${escapeHtml(channelId)}</span></div>`;
-        hasAnyData = true;
+    const username = details.username || data.channel_id || data.channel_identifier_from_url || '—';
+    const status = giphyStatusBadge(data);
+
+    container.innerHTML = `
+        <div class="single-result-card">
+            <div class="single-result-row">
+                <span class="single-label">Username:</span>
+                <span>${escapeHtml(username)}</span>
+            </div>
+            ${details.display_name ? `<div class="single-result-row"><span class="single-label">Display Name:</span><span>${escapeHtml(details.display_name)}</span></div>` : ''}
+            <div class="single-result-row">
+                <span class="single-label">Giphy Status:</span>
+                <span>${status}</span>
+            </div>
+            ${details.total_uploads !== undefined ? `<div class="single-result-row"><span class="single-label">GIFs Uploaded:</span><span>${details.total_uploads.toLocaleString()}</span></div>` : ''}
+        </div>
+    `;
+    container.style.display = 'block';
+}
+
+function showSingleError(msg) {
+    const resultDiv = document.getElementById('single-result');
+    resultDiv.innerHTML = `<div class="error-inline">⚠️ ${escapeHtml(msg)}</div>`;
+    resultDiv.style.display = 'block';
+}
+
+// ── load channels from Notion ─────────────────────────────────────────────────
+async function loadChannels() {
+    const btn = document.getElementById('load-btn');
+    const btnText = document.getElementById('load-btn-text');
+    const btnLoader = document.getElementById('load-btn-loader');
+
+    btn.disabled = true;
+    btnText.style.display = 'none';
+    btnLoader.style.display = 'inline-block';
+
+    try {
+        const res = await fetch('/api/notion-channels');
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to load channels');
+
+        allChannels = (data.channels || []).map((ch, i) => ({
+            ...ch,
+            _idx: i,
+            _giphy_status: null,   // null = not checked
+            _checking: false,
+            _error: null
+        }));
+
+        document.getElementById('channel-count').textContent = allChannels.length;
+        document.getElementById('check-all-btn').disabled = false;
+        document.getElementById('summary-bar').style.display = 'flex';
+        renderTable();
+        updateSummary();
+    } catch (e) {
+        alert('Error loading channels: ' + e.message);
+    } finally {
+        btn.disabled = false;
+        btnText.style.display = 'inline';
+        btnLoader.style.display = 'none';
     }
-    
-    // Show display name (essential)
-    if (details.display_name) {
-        html += `<div class="info-item"><strong>Display Name:</strong><span>${escapeHtml(details.display_name)}</span></div>`;
-        hasAnyData = true;
+}
+
+// ── render table ──────────────────────────────────────────────────────────────
+function renderTable() {
+    const tbody = document.getElementById('channels-tbody');
+    const table = document.getElementById('channels-table');
+    const empty = document.getElementById('channels-empty');
+    const notionFilter = document.getElementById('status-filter').value;
+    const giphyFilter = document.getElementById('giphy-filter').value;
+
+    const filtered = allChannels.filter(ch => {
+        if (notionFilter !== 'all' && ch.notion_status !== notionFilter) return false;
+        if (giphyFilter !== 'all') {
+            if (giphyFilter === 'unchecked' && ch._giphy_status !== null) return false;
+            if (giphyFilter !== 'unchecked' && ch._giphy_status !== giphyFilter) return false;
+        }
+        return true;
+    });
+
+    if (allChannels.length === 0) {
+        table.style.display = 'none';
+        empty.style.display = 'block';
+        return;
     }
-    
-    // Show profile URL (essential)
-    if (details.profile_url) {
-        html += `<div class="info-item"><strong>Profile:</strong><span><a href="${escapeHtml(details.profile_url)}" target="_blank">View Profile</a></span></div>`;
-        hasAnyData = true;
-    } else if (data.channel_id) {
-        const profileUrl = `https://giphy.com/${data.channel_id}`;
-        html += `<div class="info-item"><strong>Profile:</strong><span><a href="${escapeHtml(profileUrl)}" target="_blank">View Profile</a></span></div>`;
-        hasAnyData = true;
+
+    table.style.display = 'table';
+    empty.style.display = 'none';
+
+    tbody.innerHTML = filtered.map((ch, displayIdx) => {
+        const rowId = `row-${ch._idx}`;
+        const statusCell = renderGiphyStatusCell(ch);
+        const notionBadge = notionStatusBadge(ch.notion_status);
+        const displayUrl = ch.giphy_url.length > 35 ? ch.giphy_url.slice(0, 35) + '…' : ch.giphy_url;
+        const actionBtn = ch._checking
+            ? `<button class="btn-sm" disabled><span class="loader-sm"></span></button>`
+            : `<button class="btn-sm" onclick="checkSingleRow(${ch._idx})">Check</button>`;
+
+        return `
+            <tr id="${rowId}" class="channel-row ${ch._giphy_status ? 'row-' + ch._giphy_status : ''}">
+                <td class="col-num">${displayIdx + 1}</td>
+                <td class="col-name">${escapeHtml(ch.name || '—')}</td>
+                <td class="col-url"><a href="${escapeHtml(ch.giphy_url)}" target="_blank" title="${escapeHtml(ch.giphy_url)}">${escapeHtml(displayUrl)}</a></td>
+                <td class="col-notion">${notionBadge}</td>
+                <td class="col-giphy" id="giphy-cell-${ch._idx}">${statusCell}</td>
+                <td class="col-action" id="action-cell-${ch._idx}">${actionBtn}</td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function renderGiphyStatusCell(ch) {
+    if (ch._checking) return '<span class="loader-sm"></span>';
+    if (ch._error) return `<span class="status-pill error" title="${escapeHtml(ch._error)}">ERROR</span>`;
+    if (ch._giphy_status === null) return '<span class="status-pill unchecked">—</span>';
+    if (ch._giphy_status === 'working') return '<span class="status-pill working">✅ Working</span>';
+    if (ch._giphy_status === 'shadow_banned') return '<span class="status-pill shadow-banned">👻 Shadow Banned</span>';
+    if (ch._giphy_status === 'banned') return '<span class="status-pill banned">🚫 Banned</span>';
+    return `<span class="status-pill unknown">${escapeHtml(ch._giphy_status)}</span>`;
+}
+
+function notionStatusBadge(status) {
+    if (status === 'Verified') return '<span class="status-pill notion-verified">✓ Verified</span>';
+    if (status === 'Declined') return '<span class="status-pill notion-declined">✗ Declined</span>';
+    return `<span class="status-pill unknown">${escapeHtml(status || '—')}</span>`;
+}
+
+function giphyStatusBadge(data) {
+    if (data.banned) return '<span class="status-pill banned">🚫 Banned</span>';
+    if (data.shadow_banned) return '<span class="status-pill shadow-banned">👻 Shadow Banned</span>';
+    if (data.working) return '<span class="status-pill working">✅ Working</span>';
+    return '<span class="status-pill unknown">Unknown</span>';
+}
+
+function applyFilter() {
+    renderTable();
+}
+
+// ── check single row ──────────────────────────────────────────────────────────
+async function checkSingleRow(idx) {
+    const ch = allChannels[idx];
+    if (!ch) return;
+
+    ch._checking = true;
+    ch._error = null;
+    updateRow(idx);
+
+    try {
+        const res = await fetch('/api/check-notion-channel', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: ch.giphy_url })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Check failed');
+
+        ch._giphy_status = data.status || (data.banned ? 'banned' : data.shadow_banned ? 'shadow_banned' : data.working ? 'working' : 'unknown');
+    } catch (e) {
+        ch._error = e.message;
+    } finally {
+        ch._checking = false;
+        updateRow(idx);
+        updateSummary();
     }
-    
-    // Show total uploads (essential)
-    if (details.total_uploads !== undefined) {
-        html += `<div class="info-item"><strong>Total Uploads:</strong><span>${details.total_uploads.toLocaleString()}</span></div>`;
-        hasAnyData = true;
-    } else if (details.recent_gifs_count !== undefined) {
-        html += `<div class="info-item"><strong>Total Uploads:</strong><span>${details.recent_gifs_count.toLocaleString()}</span></div>`;
-        hasAnyData = true;
-    }
-    
-    // If no data at all, show a message
-    if (!hasAnyData) {
-        if (data.exists === false) {
-            html = '<div class="info-item"><strong>Status:</strong><span>Channel not found or inaccessible</span></div>';
-        } else {
-            html = '<div class="info-item"><strong>Status:</strong><span>Loading channel information...</span></div>';
+}
+
+function updateRow(idx) {
+    const ch = allChannels[idx];
+    const giphyCell = document.getElementById(`giphy-cell-${idx}`);
+    const actionCell = document.getElementById(`action-cell-${idx}`);
+    const row = document.getElementById(`row-${idx}`);
+
+    if (!giphyCell || !actionCell) return;
+
+    giphyCell.innerHTML = renderGiphyStatusCell(ch);
+    actionCell.innerHTML = ch._checking
+        ? `<button class="btn-sm" disabled><span class="loader-sm"></span></button>`
+        : `<button class="btn-sm" onclick="checkSingleRow(${idx})">Check</button>`;
+
+    if (row) {
+        const statusClass = ch._giphy_status ? 'row-' + ch._giphy_status : '';
+        const activeClass = ch._checking ? 'row-active' : '';
+        row.className = `channel-row ${statusClass} ${activeClass}`.trim();
+
+        if (ch._checking) {
+            row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }
     }
-    
-    channelInfo.innerHTML = html;
 }
 
-function updateStatusDetails(data) {
-    const statusDetailsCard = document.getElementById('status-details-card');
-    
-    // Hide this section as it's redundant with the status badge
-    if (statusDetailsCard) {
-        statusDetailsCard.style.display = 'none';
+// ── check all channels ────────────────────────────────────────────────────────
+async function checkAllChannels() {
+    if (checkingAll) return;
+    if (allChannels.length === 0) { alert('Load channels first'); return; }
+
+    checkingAll = true;
+    stopRequested = false;
+
+    const checkAllBtn = document.getElementById('check-all-btn');
+    const checkAllText = document.getElementById('check-all-text');
+    const checkAllLoader = document.getElementById('check-all-loader');
+    const stopBtn = document.getElementById('stop-btn');
+    const progressWrap = document.getElementById('progress-bar-wrap');
+
+    checkAllBtn.disabled = true;
+    checkAllText.style.display = 'none';
+    checkAllLoader.style.display = 'inline-block';
+    stopBtn.style.display = 'inline-block';
+    progressWrap.style.display = 'flex';
+
+    // Filter to not-yet-checked channels
+    const toCheck = allChannels.filter(ch => ch._giphy_status === null && !ch._checking);
+    let done = 0;
+    const total = toCheck.length;
+
+    updateProgress(done, total);
+
+    // Check 3 concurrently
+    const CONCURRENCY = 1;
+    const queue = [...toCheck];
+
+    async function worker() {
+        while (queue.length > 0 && !stopRequested) {
+            const ch = queue.shift();
+            if (!ch) break;
+            updateProgress(done, total, ch.name || ch.giphy_url);
+            await checkSingleRow(ch._idx);
+            done++;
+            updateProgress(done, total);
+        }
     }
+
+    const workers = Array.from({ length: CONCURRENCY }, worker);
+    await Promise.all(workers);
+
+    checkingAll = false;
+    checkAllBtn.disabled = false;
+    checkAllText.style.display = 'inline';
+    checkAllLoader.style.display = 'none';
+    stopBtn.style.display = 'none';
+    progressWrap.style.display = done === total ? 'none' : 'flex';
 }
 
-function updateDetectionResults(data) {
-    const detectionResults = document.getElementById('detection-results');
-    
-    let html = '';
-    
-    // Shadow Banned
-    html += `<div class="detection-item ${data.shadow_banned ? 'true' : 'false'}">
-        <span class="detection-icon">${data.shadow_banned ? '👻' : '✓'}</span>
-        <div>
-            <strong>Shadow Banned:</strong> ${data.shadow_banned ? 'Yes' : 'No'}
-            ${data.shadow_banned ? '<br><small>Channel exists but content is not visible or accessible</small>' : ''}
-        </div>
-    </div>`;
-    
-    // Banned
-    html += `<div class="detection-item ${data.banned ? 'true' : 'false'}">
-        <span class="detection-icon">${data.banned ? '🚫' : '✓'}</span>
-        <div>
-            <strong>Banned:</strong> ${data.banned ? 'Yes' : 'No'}
-            ${data.banned ? '<br><small>Channel has been explicitly banned</small>' : ''}
-        </div>
-    </div>`;
-    
-    // Working
-    html += `<div class="detection-item ${data.working ? 'true' : 'false'}">
-        <span class="detection-icon">${data.working ? '✅' : '✗'}</span>
-        <div>
-            <strong>Working:</strong> ${data.working ? 'Yes' : 'No'}
-            ${data.working ? '<br><small>Channel is active and accessible</small>' : ''}
-        </div>
-    </div>`;
-    
-    // Analysis Reasons (if available)
-    if (data.details && data.details.analysis_reasons && data.details.analysis_reasons.length > 0) {
-        html += `<div class="detection-item" style="background: linear-gradient(90deg, #1a1f3a 0%, #1e1e3e 100%); border-left-color: #7c8aff; margin-top: 15px;">
-            <span class="detection-icon">🔍</span>
-            <div>
-                <strong style="color: #e8eaff;">Analysis:</strong>
-                <ul style="margin: 10px 0 0 0; padding-left: 20px; font-size: 0.95rem; color: #d0d4ff; line-height: 1.6;">
-                    ${data.details.analysis_reasons.map(reason => `<li style="margin-bottom: 6px;">${escapeHtml(reason)}</li>`).join('')}
-                </ul>
-            </div>
-        </div>`;
-    }
-    
-    detectionResults.innerHTML = html;
+function stopChecking() {
+    stopRequested = true;
 }
 
-function updateAnalyticsInfo(data) {
-    const analyticsInfo = document.getElementById('analytics-info');
-    const details = data.details || {};
-    
-    let html = '';
-    
-    // Only show total views (essential information)
-    if (details.total_views !== undefined) {
-        const viewsFormatted = details.total_views_formatted || details.total_views.toLocaleString();
-        html += `<div class="info-item"><strong>Total Views:</strong><span>${viewsFormatted}</span></div>`;
-    } else {
-        html = '<div class="info-item"><strong>Total Views:</strong><span>N/A</span></div>';
-    }
-    
-    analyticsInfo.innerHTML = html;
+function updateProgress(done, total, currentName) {
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    document.getElementById('progress-bar').style.width = pct + '%';
+    const label = currentName
+        ? `${done} / ${total} — checking: ${currentName}`
+        : `${done} / ${total}`;
+    document.getElementById('progress-text').textContent = label;
 }
 
-function showError(message) {
-    const errorSection = document.getElementById('error-section');
-    const errorMessage = document.getElementById('error-message');
-    const resultsSection = document.getElementById('results-section');
-    
-    resultsSection.style.display = 'none';
-    errorMessage.textContent = message;
-    errorSection.style.display = 'block';
+// ── summary bar ───────────────────────────────────────────────────────────────
+function updateSummary() {
+    let working = 0, shadow = 0, banned = 0, error = 0, pending = 0;
+    allChannels.forEach(ch => {
+        if (ch._checking) return;
+        if (ch._error) { error++; return; }
+        if (ch._giphy_status === null) { pending++; return; }
+        if (ch._giphy_status === 'working') working++;
+        else if (ch._giphy_status === 'shadow_banned') shadow++;
+        else if (ch._giphy_status === 'banned') banned++;
+        else pending++;
+    });
+    document.getElementById('s-working').textContent = working;
+    document.getElementById('s-shadow').textContent = shadow;
+    document.getElementById('s-banned').textContent = banned;
+    document.getElementById('s-error').textContent = error;
+    document.getElementById('s-pending').textContent = pending;
 }
 
-function updateGifsGallery(data) {
-    const gifsGallery = document.getElementById('gifs-gallery');
-    const details = data.details || {};
-    
-    const allGifsToShow = details.all_gifs || details.recent_gifs || [];
-    
-    if (allGifsToShow.length > 0) {
-        let html = `<div style="margin-bottom: 20px; color: #d0d4ff; font-size: 1rem; font-weight: 600;">
-            <strong style="color: #e8eaff;">Total GIFs: ${allGifsToShow.length}</strong> | 
-            <strong style="color: #e8eaff;">Total Views: ${details.total_views_formatted || formatNumber(details.total_views || 0)}</strong>
-        </div>`;
-        
-        html += `<div class="gifs-grid">`;
-        
-        allGifsToShow.forEach((gif, index) => {
-            const viewsFormatted = (gif.views || 0).toLocaleString();
-            const accessibleIcon = gif.accessible !== false ? '✅' : '❌';
-            const gifTitle = gif.title ? escapeHtml(gif.title.substring(0, 40)) : `GIF ${index + 1}`;
-            const thumbnailUrl = gif.thumbnail_url || gif.preview_url || '';
-            
-            html += `<div class="gif-card">
-                <div class="gif-thumbnail-container">
-                    ${thumbnailUrl ? `<img src="${escapeHtml(thumbnailUrl)}" alt="${gifTitle}" class="gif-thumbnail" loading="lazy">` : '<div class="gif-placeholder">📷</div>'}
-                    <div class="gif-views-badge">👁️ ${viewsFormatted}</div>
-                </div>
-                <div class="gif-info">
-                    <div class="gif-title">${accessibleIcon} ${gifTitle}</div>
-                    ${gif.url ? `<a href="${escapeHtml(gif.url)}" target="_blank" class="gif-link">View on Giphy →</a>` : ''}
-                </div>
-            </div>`;
-        });
-        
-        html += `</div>`;
-        gifsGallery.innerHTML = html;
-    } else {
-        gifsGallery.innerHTML = '<div class="info-item"><strong>No GIFs found</strong></div>';
-    }
+// ── helpers ───────────────────────────────────────────────────────────────────
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
-
-function formatNumber(num) {
-    if (!num) return '0';
-    if (num >= 1000000000) {
-        return (num / 1000000000).toFixed(1) + 'B';
-    } else if (num >= 1000000) {
-        return (num / 1000000).toFixed(1) + 'M';
-    } else if (num >= 1000) {
-        return (num / 1000).toFixed(1) + 'K';
-    }
-    return num.toString();
-}
-
-function escapeHtml(text) {
-    if (!text) return '';
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
-
-// Allow Enter key to trigger check
-document.getElementById('giphy-url').addEventListener('keypress', function(e) {
-    if (e.key === 'Enter') {
-        checkChannel();
-    }
-});
-
