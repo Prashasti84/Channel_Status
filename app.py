@@ -1148,48 +1148,23 @@ def _check_single_gif_visibility(gif_data: tuple, tags_dict: dict = None, channe
             'found_newest': False  # Not checking newest
         }
     
-    # Check tags in parallel (up to 3 at a time) for faster execution
-    # Stop early if we find a match
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        tag_futures = {executor.submit(check_tag, tag): tag for tag in tags_to_check}
-        
-        for future in as_completed(tag_futures):
-            if found_in_any_tag:
-                # Cancel remaining futures if we already found a match
-                for remaining_future in tag_futures:
-                    if not remaining_future.done():
-                        remaining_future.cancel()
+    # Check tags sequentially in fixed order — deterministic, same result every run
+    for tag in tags_to_check:
+        try:
+            tag_result = check_tag(tag)
+            checked_tags.append(tag_result)
+            if tag_result['found']:
+                found_in_any_tag = True
                 break
-            
-            tag = tag_futures[future]
-            try:
-                tag_result = future.result()
-                checked_tags.append(tag_result)
-                
-                if tag_result['found']:
-                    found_in_any_tag = True
-                    # Cancel remaining futures
-                    for remaining_future in tag_futures:
-                        if not remaining_future.done():
-                            remaining_future.cancel()
-                    break
-            except CancelledError:
-                checked_tags.append({
-                    'tag': tag,
-                    'found': False,
-                    'found_relevant': False,
-                    'found_newest': False,
-                    'skipped': True
-                })
-            except Exception as e:
-                _log(f"    [ERROR] Error checking tag '{tag}': {str(e)}")
-                checked_tags.append({
-                    'tag': tag,
-                    'found': False,
-                    'found_relevant': False,
-                    'found_newest': False,
-                    'error': str(e)
-                })
+        except Exception as e:
+            _log(f"    [ERROR] Error checking tag '{tag}': {str(e)}")
+            checked_tags.append({
+                'tag': tag,
+                'found': False,
+                'found_relevant': False,
+                'found_newest': False,
+                'error': str(e)
+            })
     
     # Sort checked_tags by original order
     tag_order = {tag: i for i, tag in enumerate(tags_to_check)}
@@ -1272,24 +1247,21 @@ def check_shadow_banned_channel(channel_username: str, channel_gifs: list = None
     gif_results_dict = {}  # Store results by index to maintain order
     
     with ThreadPoolExecutor(max_workers=8) as executor:
-        gif_futures = {executor.submit(_check_single_gif_visibility, gif_data, tags_dict, channel_username): gif_data 
+        gif_futures = {executor.submit(_check_single_gif_visibility, gif_data, tags_dict, channel_username): gif_data
                       for gif_data in gif_data_list}
-        
+
+        # Wait for ALL GIFs to complete — no early exit ensures deterministic visibility count
         for future in as_completed(gif_futures):
+            gif_data = gif_futures[future]
+            index = gif_data[0] - 1
             try:
                 gif_result = future.result()
-                gif_data = gif_futures[future]
-                index = gif_data[0] - 1  # Convert to 0-based index
                 gif_results_dict[index] = gif_result
-                
                 if gif_result.get('found'):
                     result['gifs_found_in_search'] += 1
                 else:
                     result['gifs_not_found'] += 1
             except Exception as e:
-                # Handle exceptions from individual GIF checks
-                gif_data = gif_futures.get(future, (0, 0, {}))
-                index = gif_data[0] - 1 if len(gif_data) > 0 else 0
                 gif_id = gif_data[2].get('id', 'unknown') if len(gif_data) > 2 else 'unknown'
                 _log(f"    [ERROR] Failed to check GIF {gif_id}: {str(e)}")
                 gif_results_dict[index] = {
@@ -3060,6 +3032,7 @@ def fetch_views_from_api_for_channel(channel_id, gif_ids, store_in_db=True):
 
 # Lightweight cache file for real-time comparison (no database needed)
 CACHE_FILE = 'channel_views_cache.json'
+_cache_file_lock = threading.Lock()
 
 def get_cached_views(channel_id):
     """Get last cached views for a channel from lightweight JSON file"""
@@ -3075,26 +3048,27 @@ def get_cached_views(channel_id):
 
 def cache_views(channel_id, views_data):
     """Cache current views for a channel in lightweight JSON file"""
-    cache = {}
-    if os.path.exists(CACHE_FILE):
+    with _cache_file_lock:
+        cache = {}
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, 'r') as f:
+                    cache = json.load(f)
+            except:
+                cache = {}
+
+        cache[channel_id] = {
+            'total_views': views_data['total_views'],
+            'gif_views': views_data.get('gif_views', {}),
+            'timestamp': views_data.get('timestamp', datetime.now().isoformat()),
+            'fetched_count': views_data.get('fetched_count', 0)
+        }
+
         try:
-            with open(CACHE_FILE, 'r') as f:
-                cache = json.load(f)
-        except:
-            cache = {}
-    
-    cache[channel_id] = {
-        'total_views': views_data['total_views'],
-        'gif_views': views_data.get('gif_views', {}),
-        'timestamp': views_data.get('timestamp', datetime.now().isoformat()),
-        'fetched_count': views_data.get('fetched_count', 0)
-    }
-    
-    try:
-        with open(CACHE_FILE, 'w') as f:
-            json.dump(cache, f, indent=2)
-    except Exception as e:
-        print(f"  Warning: Could not cache views: {e}")
+            with open(CACHE_FILE, 'w') as f:
+                json.dump(cache, f, indent=2)
+        except Exception as e:
+            print(f"  Warning: Could not cache views: {e}")
 
 def get_realtime_channel_views_comparison(channel_id, gif_ids):
     """
